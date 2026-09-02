@@ -262,3 +262,15 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+---
+
+## kernel-hardening branch runbook (Sportacus fork)
+
+This branch pre-patches `/opt/hermes` at image build; the runtime boot hook
+is only a tripwire. **Updating** when a new upstream tag lands: merge the tag
+into `kernel-hardening`, resolve conflicts in the 5 kernel files (only),
+update `KERNEL_BASE`, run the requeue regression suite, push, deploy.
+A weekly watcher pings on drift (latest upstream tag vs `KERNEL_BASE`).
+Full runbook: [README.kernel-hardening.md](README.kernel-hardening.md).
+
