@@ -429,6 +429,237 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# How old a rate-limit sentinel sidecar may be and still speak for the run
+# being closed. Sentinels are written just before a worker exits 75; the
+# sweep that consumes one normally arrives within a tick or two. Anything
+# older is stale residue from a previous episode (the task has since run
+# again) and must NOT reclassify a fresh death — it gets swept instead.
+RATE_LIMIT_SENTINEL_MAX_AGE_SECONDS = 30 * 60
+
+
+def rate_limit_sentinel_path(task_id: str, board: Optional[str] = None) -> Path:
+    """Path of the rate-limit sentinel sidecar for ``task_id``.
+
+    Lives under the board's state dir (sibling of ``logs/`` and
+    ``workspaces/``), not the task workspace — the workspace can be
+    recreated/reassigned across attempts while the board state dir is
+    stable for the life of the board. Worker (writer) and dispatchers
+    (readers) resolve it through the same board-resolution chain pinned
+    by ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` env vars.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    root = (
+        kanban_home() / "kanban"
+        if slug == DEFAULT_BOARD
+        else board_dir(slug)
+    )
+    return root / "state" / "rate_limit_sentinels" / f"{task_id}.json"
+
+
+def _consume_rate_limit_sentinel(
+    task_id: str,
+    *,
+    expected_pid: Optional[int],
+    conn: sqlite3.Connection,
+) -> Optional[dict]:
+    """Atomically consume a fresh rate-limit sentinel for ``task_id``.
+
+    Returns the parsed sentinel payload when one exists, was written by
+    ``expected_pid`` (or the pid check is skipped), and is younger than
+    ``RATE_LIMIT_SENTINEL_MAX_AGE_SECONDS``; the file is then removed so a
+    later sweep can't double-consume it. Returns None (and leaves stale
+    files for the sweeper) otherwise.
+    """
+    path = rate_limit_sentinel_path(task_id)
+    try:
+        if not path.is_file():
+            return None
+        raw = path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            path.unlink(missing_ok=True)
+            return None
+        ts = int(payload.get("ts") or 0)
+        if (time.time() - ts) > RATE_LIMIT_SENTINEL_MAX_AGE_SECONDS:
+            path.unlink(missing_ok=True)
+            return None
+        if expected_pid is not None:
+            try:
+                sentinel_pid = int(payload.get("pid") or 0)
+            except (TypeError, ValueError):
+                sentinel_pid = 0
+            if sentinel_pid and sentinel_pid != int(expected_pid):
+                # Sentinel from a different (earlier) worker incarnation —
+                # not evidence about THIS death. Sweep it so it can't mask
+                # a later genuine crash.
+                path.unlink(missing_ok=True)
+                return None
+        path.unlink(missing_ok=True)
+        return payload
+    except Exception:
+        return None
+
+
+def _sweep_stale_rate_limit_sentinels(board: Optional[str] = None) -> None:
+    """Remove sentinel sidecars older than the max age (best-effort)."""
+    try:
+        root = rate_limit_sentinel_path("___probe___", board=board).parent
+        if not root.is_dir():
+            return
+        cutoff = time.time() - RATE_LIMIT_SENTINEL_MAX_AGE_SECONDS
+        for p in root.glob("*.json"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+
+# ── Restart windows (worker-triggered container/host restarts) ──────────
+#
+# A worker that is about to restart the gateway's container (e.g. applying a
+# kernel patch at a restart boundary) kills every gateway-spawned worker on
+# the host — its own run AND unrelated siblings mid-flight. Without a
+# coordination gate the blast is classified as a mass crash and (with the
+# old systemic rule) insta-blocked the whole wave. The protocol:
+#
+#   1. BEFORE restarting, the worker opens a window:
+#      ``open_restart_window(opened_by, task_id, reason, ttl_seconds=600)``
+#   2. The dispatcher holds ALL spawns while any window is open.
+#   3. Deaths swept inside the window close as ``restart_killed`` —
+#      requeue WITHOUT a failure tick (same semantics as rate_limited).
+#   4. The restarting worker (or a sweeper, after the TTL) closes the
+#      window; the next tick resumes spawning.
+#
+# The TTL is the safety valve: a worker that dies between "open" and
+# "restart" leaves a window that would otherwise hold spawns forever. Ten
+# minutes comfortably covers a docker restart + gateway re-init cycle.
+
+RESTART_WINDOW_DEFAULT_TTL_SECONDS = 600
+
+
+def open_restart_window(
+    conn: sqlite3.Connection,
+    *,
+    opened_by: str,
+    task_id: Optional[str] = None,
+    reason: Optional[str] = None,
+    host: Optional[str] = None,
+) -> int:
+    """Declare a restart window; returns the window id.
+
+    Idempotent per opener+task: an already-open window by the same opener
+    is returned unchanged (a retry after a transient DB lock must not
+    stack windows). Windows apply board-wide — any live worker reaped
+    during the window is treated as restart-killed, not crashed.
+    """
+    now = int(time.time())
+    host = host or _claimer_id().split(":", 1)[0]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id FROM kanban_restart_windows "
+            "WHERE closed_at IS NULL AND opened_by = ? AND task_id IS ?",
+            (opened_by, task_id),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"] or 0)
+        cur = conn.execute(
+            "INSERT INTO kanban_restart_windows "
+            "(opened_at, closed_at, opened_by, task_id, reason, host) "
+            "VALUES (?, NULL, ?, ?, ?, ?)",
+            (now, opened_by, task_id, reason, host),
+        )
+        window_id = int(cur.lastrowid or 0)
+        if task_id:
+            _append_event(
+                conn, task_id, "restart_window_opened",
+                {
+                    "window_id": window_id,
+                    "opened_by": opened_by,
+                    "reason": reason,
+                    "ttl_seconds": RESTART_WINDOW_DEFAULT_TTL_SECONDS,
+                },
+            )
+    return window_id
+
+
+def close_restart_window(
+    conn: sqlite3.Connection,
+    window_id: Optional[int] = None,
+    *,
+    opened_by: Optional[str] = None,
+    task_id: Optional[str] = None,
+) -> int:
+    """Close a restart window (by id, or the opener's open window).
+
+    Returns the number of windows closed. Expiry is ALSO enforced lazily by
+    :func:`active_restart_window` so an abandoned window can't hold spawns
+    forever even if nothing ever calls this.
+    """
+    closed = 0
+    now = int(time.time())
+    with write_txn(conn):
+        if window_id is not None:
+            cur = conn.execute(
+                "UPDATE kanban_restart_windows SET closed_at = ? "
+                "WHERE id = ? AND closed_at IS NULL",
+                (now, int(window_id)),
+            )
+            closed += cur.rowcount
+        else:
+            cur = conn.execute(
+                "UPDATE kanban_restart_windows SET closed_at = ? "
+                "WHERE closed_at IS NULL AND opened_by IS ? AND task_id IS ?",
+                (now, opened_by, task_id),
+            )
+            closed += cur.rowcount
+    return closed
+
+
+def active_restart_window(conn: sqlite3.Connection) -> Optional[dict]:
+    """Return the active (open, unexpired) restart window, if any.
+
+    Expired-but-unclosed windows are closed lazily here (TTL safety valve)
+    and do not count as active.
+    """
+    now = int(time.time())
+    cutoff = now - RESTART_WINDOW_DEFAULT_TTL_SECONDS
+    with write_txn(conn):
+        expired = conn.execute(
+            "SELECT id FROM kanban_restart_windows "
+            "WHERE closed_at IS NULL AND opened_at < ?",
+            (cutoff,),
+        ).fetchall()
+        for row in expired:
+            conn.execute(
+                "UPDATE kanban_restart_windows SET closed_at = ? WHERE id = ?",
+                (now, row["id"]),
+            )
+        row = conn.execute(
+            "SELECT id, opened_at, opened_by, task_id, reason, host "
+            "FROM kanban_restart_windows WHERE closed_at IS NULL "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "opened_at": int(row["opened_at"]),
+        "opened_by": row["opened_by"],
+        "task_id": row["task_id"],
+        "reason": row["reason"],
+        "host": row["host"],
+    }
+
+
+def restart_window_holds_spawns(conn: sqlite3.Connection) -> bool:
+    """True while a restart window is active — dispatch holds new spawns."""
+    return active_restart_window(conn) is not None
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -1556,6 +1787,27 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Declared container/host restart windows. A worker (or operator) that is
+-- about to restart the gateway's container opens a window BEFORE doing so;
+-- deaths detected inside the window (the restarting card's own run AND any
+-- sibling runs reaped by the same restart) close as ``restart_killed`` —
+-- a neutral outcome like ``rate_limited`` — instead of counting a crash.
+-- The dispatcher also holds spawns while a window is active so freshly
+-- spawned workers aren't killed by the pending restart mid-boot.
+CREATE TABLE IF NOT EXISTS kanban_restart_windows (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    opened_at    INTEGER NOT NULL,
+    closed_at    INTEGER,
+    opened_by    TEXT NOT NULL,
+    task_id      TEXT,
+    reason       TEXT,
+    -- Host/container identity that opened the window; used to keep
+    -- multi-host boards honest (a window applies everywhere, but the
+    -- opener is recorded for forensics).
+    host         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_restart_windows_open  ON kanban_restart_windows(closed_at);
 """
 
 
@@ -2740,6 +2992,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # Restart-window bookkeeping table (added after the 2026-09-02 incident:
+    # a worker-armed container restart killed four sibling runs and the
+    # systemic-fingerprint rule insta-blocked the whole wave). Legacy DBs
+    # created the table via SCHEMA_SQL's IF NOT EXISTS on newer code; this
+    # explicit create covers DBs whose SCHEMA_SQL predates the table.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS kanban_restart_windows (\n"
+        "    id           INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+        "    opened_at    INTEGER NOT NULL,\n"
+        "    closed_at    INTEGER,\n"
+        "    opened_by    TEXT NOT NULL,\n"
+        "    task_id      TEXT,\n"
+        "    reason       TEXT,\n"
+        "    host         TEXT\n"
+        ")"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_restart_windows_open "
+        "ON kanban_restart_windows(closed_at)"
+    )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -8138,6 +8411,16 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# Machine-authored comment authors whose PR URLs are echoes of *external*
+# events (a webhook mirroring a GitHub PR), not evidence that a prior
+# kanban worker opened a PR. The respawn guard's active_pr rule must not
+# park a card for 24h on these. Author comparison is case-insensitive.
+_RESPAWN_GUARD_MACHINE_COMMENT_AUTHORS = frozenset({
+    "github-webhook",
+    "dispatcher",
+    "webhook",
+})
+
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
@@ -8201,6 +8484,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    restart_killed: list[str] = field(default_factory=list)
+    """Task ids whose workers were reaped inside a declared restart window
+    (worker-armed container/host restart) and were requeued WITHOUT
+    counting a failure. Spawning is held while the window is open; on
+    close, these resume on the next tick."""
+    restart_window_hold: bool = False
+    """True when this tick held spawns because a restart window was open."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9011,6 +9301,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    restart_killed: list[str] = []
+    # An active restart window converts content-free deaths inside it into
+    # neutral ``restart_killed`` requeues (no failure tick) — the declaring
+    # worker's own run AND every sibling run reaped by the same container
+    # restart. Evaluated BEFORE the sweep so the TTL lazy-close below sees
+    # a consistent view.
+    _restart_window = active_restart_window(conn)
+    # Content-free crash errors ("pid N not alive") inside a window also
+    # must not poison the systemic fingerprint counts.
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -9048,6 +9347,48 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            _sentinel: Optional[dict] = None
+            # Restart window active: any death (except an EXPLICIT clean
+            # exit / rate-limit sentinel, which carry their own semantics)
+            # is attributed to the declared restart — neutral requeue, no
+            # failure tick, no crash fingerprint. This covers the restarting
+            # card's own run and every sibling run the restart reaped.
+            if (
+                _restart_window is not None
+                and kind in ("unknown", "nonzero_exit", "signaled")
+            ):
+                kind = "restart_killed"
+                protocol_violation = False
+                error_text = (
+                    f"pid {pid} reaped inside declared restart window "
+                    f"(id={_restart_window['id']}, opened_by="
+                    f"{_restart_window['opened_by']}) — requeued without "
+                    f"counting a failure"
+                )
+                event_kind = "restart_killed"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "window_id": _restart_window["id"],
+                    "opened_by": _restart_window["opened_by"],
+                }
+            elif kind == "rate_limited":
+                rate_limited_exit = True
+            elif kind == "unknown":
+                # This sweeper never reaped the child (a second dispatcher
+                # process raced us, or the gateway restarted) so the exit
+                # code is invisible here. The worker's sentinel sidecar —
+                # written just before it exited EX_TEMPFAIL — survives
+                # process death and closes that race: a fresh sentinel
+                # whose pid matches THIS task's worker reclassifies the
+                # death as the same neutral quota-wall requeue.
+                _sentinel = _consume_rate_limit_sentinel(
+                    row["id"], expected_pid=pid, conn=conn,
+                )
+                if _sentinel is not None:
+                    rate_limited_exit = True
+                    kind = "rate_limited"
+                    code = KANBAN_RATE_LIMIT_EXIT_CODE
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -9095,6 +9436,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                if _sentinel is not None:
+                    # Reclassified from a content-free death via the sidecar —
+                    # record which throttle class the worker itself reported.
+                    event_payload["sentinel"] = True
+                    event_payload["reason"] = str(
+                        _sentinel.get("reason") or "rate_limit"
+                    )[:60]
+            elif kind == "restart_killed":
+                # Already fully classified by the restart-window branch
+                # above (error_text / event_kind / event_payload set).
+                pass
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -9119,10 +9471,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Rate-limited / restart-killed requeues are a clean release,
+                # not a crash — record the run outcome so the board history
+                # doesn't show a phantom crash for a quota wall or a declared
+                # container restart.
+                if rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                elif kind == "restart_killed":
+                    _run_outcome = "restart_killed"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9155,6 +9513,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif kind == "restart_killed":
+                    # Neutral requeue — same "no failure tick" semantics as
+                    # rate_limited, but respawn is NOT deferred (the restart
+                    # window itself holds spawns until it closes).
+                    restart_killed.append(row["id"])
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9244,7 +9607,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     auto_blocked.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
+            # Systemic-detection guard: "pid N not alive" (and the generic
+            # nonzero-exit form without a code) are CONTENT-FREE — they say
+            # "the process is gone", not why. Every worker killed by a
+            # container restart, host reboot, or provider-burst-exhaustion
+            # produces the identical fingerprint, so a mass-death sweep
+            # (≥3 in one tick) forced failure_limit=1 and insta-blocked the
+            # whole wave — the 2026-09-02 incident where one docker restart
+            # gave_up'd four cards in a second. Content-free fingerprints
+            # must not escalate; only a repeated DIAGNOSTIC error (a real
+            # traceback, a named exit code) is evidence of a systemic fault.
+            _is_content_free = (
+                "not alive" in error_text or "not alive" in fp
+            )
+            is_systemic = (
+                not _is_content_free and _fp_counts.get(fp, 0) >= 3
+            )
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
@@ -9264,6 +9642,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # And for restart-window requeues (same neutral semantics).
+    detect_crashed_workers._last_restart_killed = restart_killed  # type: ignore[attr-defined]
+    # Opportunistic hygiene: drop sentinel sidecars old enough that no run
+    # they could speak for is still open.
+    _sweep_stale_rate_limit_sentinels()
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -9659,11 +10042,41 @@ def check_respawn_guard(
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+    # Two guards on the scan itself:
+    #
+    # a) Machine-authored echoes don't count. A PR URL posted by
+    #    ``github-webhook`` (or the dispatcher) is a mirror of an EXTERNAL
+    #    GitHub event, not evidence that a prior kanban worker opened a PR
+    #    — e.g. a bot-side engineering push to a fork triggered a webhook
+    #    PR notification on the card. Treating it as active_pr parked both
+    #    FO-requeued cards for 24h with zero spawns (2026-09-02 incident).
+    # b) A deliberate requeue after the newest PR comment re-arms spawning
+    #    — the same ``status``/``promoted``/``unblocked``/``reclaimed``
+    #    event set rule 3 (recent_success) already honors. An operator
+    #    dragging a card back to ready IS an explicit "run it again".
+    _pr_comment_rows = conn.execute(
+        "SELECT body, author, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
-    ).fetchall():
+    ).fetchall()
+    newest_pr_comment_at = None
+    for c in _pr_comment_rows:
+        author = (c["author"] or "").strip().lower() if "author" in c.keys() else ""
+        if author in _RESPAWN_GUARD_MACHINE_COMMENT_AUTHORS:
+            continue
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            at = int(c["created_at"] or 0)
+            if newest_pr_comment_at is None or at > newest_pr_comment_at:
+                newest_pr_comment_at = at
+    if newest_pr_comment_at is not None:
+        requeued_after_pr = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND created_at >= ? "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "LIMIT 1",
+            (task_id, newest_pr_comment_at),
+        ).fetchone()
+        if not requeued_after_pr:
             return "active_pr"
 
     return None
@@ -10100,6 +10513,22 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Restart-window requeues (declared container restart, no failure
+    # counted) — surface for telemetry / tests.
+    _crash_restart_killed = getattr(
+        detect_crashed_workers, "_last_restart_killed", []
+    )
+    if _crash_restart_killed:
+        result.restart_killed.extend(_crash_restart_killed)
+    # Restart-window spawn hold: a worker (or operator) has declared a
+    # container/host restart. Spawning now would create workers the restart
+    # kills seconds later — each burning a claim and a crash sweep. Hold
+    # spawns while the window is open; the requeued cards resume on the
+    # first tick after the window closes (or expires via its TTL).
+    if restart_window_holds_spawns(conn):
+        result.restart_window_hold = True
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+        return result
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

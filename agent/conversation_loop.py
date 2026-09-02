@@ -89,7 +89,10 @@ from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
+    parse_retry_after_seconds,
     zai_coding_overload_retry_ceiling,
+    transient_throttle_retry_ceiling,
+    is_transient_throttle_reason,
 )
 from agent.repetition_guard import is_repetition_dominated
 from agent.trajectory import has_incomplete_scratchpad
@@ -5458,6 +5461,15 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # Generic transient throttle (rate limit / overload / upstream
+                # 429 on ANY provider): same deepening of the retry budget so
+                # the adaptive long-backoff tier (15/30/60/60) is reachable.
+                # Sized so a ~90s provider overload burst can no longer
+                # exhaust the loop at the default budget of 3 — the turn now
+                # waits it out, and if it still fails the terminal result
+                # carries the failure_reason for the worker exit-code mapping.
+                elif is_transient_throttle_reason(classified.reason):
+                    max_retries = max(max_retries, transient_throttle_retry_ceiling())
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
@@ -6573,42 +6585,49 @@ def run_conversation(
 
                 # For rate limits, respect the Retry-After header if present
                 _retry_after = None
-                if is_rate_limited:
+                # Retry-After applies to the whole transient-throttle family
+                # (rate limit AND provider overload 429/503/529) — a server
+                # that tells us exactly when to come back should be believed
+                # in both cases. Parsed via the shared helper (numeric +
+                # HTTP-date forms) and capped at 10 minutes (#26293).
+                _throttle_family = is_rate_limited or is_transient_throttle_reason(classified.reason)
+                if _throttle_family:
                     _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                    if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                        if _ra_raw:
-                            try:
-                                # Cap at 10 minutes. Anthropic Tier 1 input-token
-                                # buckets reset in ~171s, so a 120s cap caused us to
-                                # retry before the actual reset window and re-trip the
-                                # limit. 600s covers all realistic provider reset
-                                # windows while still rejecting pathological values. (#26293)
-                                _retry_after = min(float(_ra_raw), 600)
-                            except (TypeError, ValueError):
-                                pass
+                    if _resp_headers is None and getattr(api_error, "headers", None) is not None:
+                        _resp_headers = api_error.headers
+                    if _resp_headers is not None:
+                        _retry_after = parse_retry_after_seconds(_resp_headers)
+                        if _retry_after is not None:
+                            _retry_after = min(_retry_after, 600.0)
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
-                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
+                if _throttle_family and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
                         model=_model,
                         error=api_error,
                         default_wait=wait_time,
+                        failure_reason=classified.reason,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                if _throttle_family:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
+                    elif _backoff_policy == "transient_throttle_long":
+                        _policy_note = " (transient throttle adaptive long backoff)"
+                    elif _backoff_policy == "transient_throttle_short":
+                        _policy_note = " (transient throttle short retry)"
+                    elif _retry_after:
+                        _policy_note = " (honoring Retry-After header)"
                     _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
-                    # Z.AI Coding waits are different: they can last minutes, so surface
+                    # throttle waits are different: they can last minutes, so surface
                     # progress immediately instead of making the TUI look frozen.
-                    if _backoff_policy == "zai_coding_overload_long":
+                    if _backoff_policy in ("zai_coding_overload_long", "transient_throttle_long") or (_retry_after and _retry_after >= 30):
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)

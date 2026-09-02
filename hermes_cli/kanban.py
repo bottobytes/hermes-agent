@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import json
 import os
 import shlex
@@ -748,6 +749,35 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_tail.add_argument("task_id")
     p_tail.add_argument("--interval", type=float, default=1.0)
 
+    # --- restart-window ---
+    p_rw = sub.add_parser(
+        "restart-window",
+        help="Declare/inspect container-restart windows (spawn hold + neutral requeue)",
+    )
+    p_rw_sub = p_rw.add_subparsers(dest="restart_window_action")
+
+    p_rw_open = p_rw_sub.add_parser(
+        "open",
+        help="Declare an imminent container/host restart: holds spawns and "
+             "requeues any worker death inside the window without a failure tick",
+    )
+    p_rw_open.add_argument("--reason", default=None,
+                           help="Why the restart is happening (recorded on the window)")
+    p_rw_open.add_argument("--task-id", default=None,
+                           help="Task id of the worker performing the restart, if any")
+
+    p_rw_close = p_rw_sub.add_parser(
+        "close",
+        help="Close an open restart window (by id, or your own open window)",
+    )
+    p_rw_close.add_argument("window_id", nargs="?", type=int, default=None)
+
+    p_rw_list = p_rw_sub.add_parser(
+        "list", help="List restart windows (open first)"
+    )
+    p_rw_list.add_argument("--all", action="store_true",
+                           help="Include closed/expired windows, not just open ones")
+
     # --- dispatch ---
     p_disp = sub.add_parser(
         "dispatch",
@@ -1136,6 +1166,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
+            "restart-window": _cmd_restart_window,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
@@ -1518,6 +1549,54 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         return 1
     print(f"Heartbeat recorded for {args.task_id}")
     return 0
+
+
+def _cmd_restart_window(args: argparse.Namespace) -> int:
+    action = getattr(args, "restart_window_action", None)
+    if action == "open":
+        with kb.connect_closing() as conn:
+            window_id = kb.open_restart_window(
+                conn,
+                opened_by=_profile_author(),
+                task_id=getattr(args, "task_id", None),
+                reason=getattr(args, "reason", None),
+            )
+        print(f"Restart window {window_id} OPEN — spawns held, deaths inside requeue neutrally.")
+        print("Close it with `hermes kanban restart-window close` after the restart completes.")
+        return 0
+    if action == "close":
+        with kb.connect_closing() as conn:
+            closed = kb.close_restart_window(
+                conn,
+                getattr(args, "window_id", None),
+            )
+        if closed:
+            print(f"Closed {closed} restart window(s) — spawning resumes next tick.")
+            return 0
+        print("No matching open restart window.", file=sys.stderr)
+        return 1
+    if action == "list":
+        with kb.connect_closing() as conn:
+            rows = conn.execute(
+                "SELECT id, opened_at, closed_at, opened_by, task_id, reason "
+                "FROM kanban_restart_windows "
+                + ("" if getattr(args, "all", False) else "WHERE closed_at IS NULL ")
+                + "ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        if not rows:
+            print("(no restart windows)")
+            return 0
+        for r in rows:
+            state = "OPEN" if r["closed_at"] is None else "closed"
+            opened = datetime.datetime.fromtimestamp(int(r["opened_at"])).strftime("%m-%d %H:%M:%S")
+            print(
+                f"#{r['id']:>3} [{state}] {opened} by {r['opened_by']}"
+                f"{' task=' + r['task_id'] if r['task_id'] else ''}"
+                f"{' — ' + (r['reason'] or '')[:60] if r['reason'] else ''}"
+            )
+        return 0
+    print("kanban: restart-window requires open|close|list", file=sys.stderr)
+    return 2
 
 
 def _cmd_assignees(args: argparse.Namespace) -> int:
@@ -2676,6 +2755,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "rate_limited": res.rate_limited,
+            "restart_killed": res.restart_killed,
+            "restart_window_hold": res.restart_window_hold,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned

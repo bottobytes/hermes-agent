@@ -16871,6 +16871,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self._voice_continuous:
                     self._voice_continuous = False
                     _cprint(f"\n{_DIM}Continuous voice mode stopped due to error.{_RST}")
+            # Expose the turn's terminal failure classification (failure_reason /
+            # failure_retryable, set by the conversation loop's exhaustion path)
+            # so single-query callers can map a transient provider throttle to
+            # the kanban EX_TEMPFAIL exit instead of a generic failure. Best-effort:
+            # a non-dict result simply clears the stash.
+            self._last_turn_failure_reason = (
+                result.get("failure_reason") if isinstance(result, dict) else None
+            )
+            self._last_turn_failed = bool(isinstance(result, dict) and result.get("failed"))
 
             # Handle interrupt - check if we were interrupted
             pending_message = None
@@ -21042,6 +21051,93 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Kanban worker transient-throttle exit mapping (EX_TEMPFAIL sentinel)
+# (#t_d4c215a7 — provider-burst mass-kill fix)
+# ---------------------------------------------------------------------------
+
+# Failure reasons that mean "the provider throttled us, the task itself is
+# fine": a momentary rate limit, an upstream-aggregator 429, or a
+# server-side overload. When a kanban worker's turn ends in one of these
+# after the (now deeper) retry budget, the process exits with the
+# EX_TEMPFAIL sentinel (75) so the dispatcher requeues the task WITHOUT
+# counting a failure — the same semantics as a stale-claim reclaim.
+# ``billing`` stays in the set: a quota wall is equally not-a-task-error,
+# and the rate-limit respawn-guard cooldown defers the retry sensibly.
+_KANBAN_TRANSIENT_EXIT_FAILURE_REASONS = ("rate_limit", "upstream_rate_limit", "overloaded", "billing")
+
+
+def _kanban_transient_failure_reason(result) -> "str | None":
+    """Return the transient failure reason from a run_conversation result, if any.
+
+    Accepts the result dict (``failure_reason`` set by the conversation loop's
+    terminal-exhaustion path) or the CLI wrapper (``_last_turn_failure_reason``
+    stashed by :meth:`CLI.chat` for the non-quiet single-query path).
+    """
+    if not isinstance(result, dict):
+        return None
+    if result.get("failure_reason") in _KANBAN_TRANSIENT_EXIT_FAILURE_REASONS:
+        return result["failure_reason"]
+    return None
+
+
+def _write_rate_limit_sentinel(reason: "str | None") -> None:
+    """Drop a sidecar file recording that THIS worker bailed on a throttle.
+
+    The dispatcher's reap classifier maps an exit code 75 to a neutral
+    ``rate_limited`` requeue — but only when IT reaped the child (exit codes
+    live in the reaping process's kernel tables). A second dispatcher
+    process (cron-driven CLI dispatch, a restarted gateway) sweeping the
+    board sees only "pid not alive" and classifies a crash. The sidecar
+    survives process death and host restarts, closing that race: any
+    sweeper, before counting a failure, checks for the sentinel of the run
+    it is about to close and treats it as the quota-wall case.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return
+    try:
+        from hermes_cli.kanban_db import rate_limit_sentinel_path
+        path = rate_limit_sentinel_path(task_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import time as _time
+        path.write_text(
+            json.dumps({
+                "task_id": task_id,
+                "reason": reason or "rate_limit",
+                "pid": os.getpid(),
+                "ts": int(_time.time()),
+            }),
+            encoding="utf-8",
+        )
+    except Exception as exc:  # pragma: no cover — best-effort sidecar
+        logger.debug("rate-limit sentinel write failed: %s", exc)
+
+
+def _kanban_exit_code_for_result(result) -> int:
+    """Map a failed worker turn to its process exit code.
+
+    0 — success; 1 — generic failure; 75 (EX_TEMPFAIL) — the provider
+    throttled us (rate limit / overload family), the task is fine. Only
+    kanban workers (``HERMES_KANBAN_TASK`` set) get the sentinel mapping;
+    ordinary automation wrappers keep the plain 0/1 contract.
+    """
+    if isinstance(result, dict) and result.get("failed"):
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            reason = _kanban_transient_failure_reason(result)
+            if reason is not None:
+                _write_rate_limit_sentinel(reason)
+                try:
+                    from hermes_cli.kanban_db import (
+                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+                    )
+                    return _RL_CODE
+                except Exception:
+                    return 1
+        return 1
+    return 0
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -21603,29 +21699,18 @@ def main(
                         # Ensure proper exit code for automation wrappers.
                         #
                         # Kanban workers get a special case: when the run failed
-                        # purely because the provider rate-limited / exhausted
-                        # quota (not because the task itself is broken), exit with
-                        # the EX_TEMPFAIL sentinel instead of the generic 1. The
-                        # dispatcher's reap classifier maps that code to a
-                        # ``rate_limited`` exit and releases the task back to
-                        # ``ready`` WITHOUT incrementing the failure counter, so a
-                        # 5-hour quota window can't trip the circuit breaker and
-                        # permanently block the card. Non-kanban runs keep the
-                        # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
-                        sys.exit(_exit_code)
+                        # because the provider rate-limited / throttled /
+                        # overloaded (not because the task itself is broken),
+                        # exit with the EX_TEMPFAIL sentinel instead of the
+                        # generic 1. The dispatcher's reap classifier maps that
+                        # code to a ``rate_limited`` exit and releases the task
+                        # back to ``ready`` WITHOUT incrementing the failure
+                        # counter, so a provider burst can't trip the circuit
+                        # breaker and block the card. A sidecar file makes the
+                        # classification survive dispatchers that never reaped
+                        # this child. Non-kanban runs keep the plain 0/1
+                        # contract automation wrappers expect.
+                        sys.exit(_kanban_exit_code_for_result(result))
 
                 # Exit with error code if credentials or agent init fails
                 sys.exit(1)
@@ -21651,6 +21736,17 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                # Kanban workers (non-goal-mode) run on this path: the
+                # dispatcher spawns `hermes … chat -q <prompt>` WITHOUT -Q.
+                # Map a terminal provider throttle (rate limit / overload
+                # family) to the EX_TEMPFAIL sentinel + sidecar so the
+                # requeue semantics match the quiet path above — the task
+                # returns to ready with no failure tick instead of dying
+                # as a content-free crash.
+                sys.exit(_kanban_exit_code_for_result({
+                    "failed": bool(getattr(cli, "_last_turn_failed", False)),
+                    "failure_reason": getattr(cli, "_last_turn_failure_reason", None),
+                }))
         finally:
             _finalize_single_query(cli)
         return
