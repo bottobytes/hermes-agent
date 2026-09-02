@@ -1045,6 +1045,38 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
+
+# ---------------------------------------------------------------------------
+# TEXT coercion — one blob cell anywhere poisons JSON serializers (#997eb31b)
+# ---------------------------------------------------------------------------
+
+def _text(value, *, field: str = "value"):
+    """Coerce str/bytes (and reject nothing) to TEXT for sqlite binding.
+
+    A worker once bound ``json.dumps({...}).encode()`` straight into
+    ``tasks.result`` via raw SQL surgery; sqlite stored a BLOB, and the
+    board's JSON serializer 500'd for every user. Every kernel write to a
+    TEXT-typed column goes through this so bytes can never bind again.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, bytearray):
+        return bytes(value).decode("utf-8", errors="replace")
+    if isinstance(value, memoryview):
+        return value.tobytes().decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _text_opt(value):
+    """``_text`` for nullable columns — None passes through unchanged."""
+    if value is None:
+        return None
+    return _text(value)
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -1156,8 +1188,8 @@ class Task:
                 skills_value = None
         return cls(
             id=row["id"],
-            title=row["title"],
-            body=row["body"],
+            title=_text(row["title"]),
+            body=_text_opt(row["body"]),
             assignee=row["assignee"],
             status=row["status"],
             priority=row["priority"],
@@ -1172,7 +1204,7 @@ class Task:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
-            result=row["result"] if "result" in keys else None,
+            result=_text_opt(row["result"] if "result" in keys else None),
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
             consecutive_failures=(
                 row["consecutive_failures"] if "consecutive_failures" in keys
@@ -1286,9 +1318,9 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
             outcome=row["outcome"],
-            summary=row["summary"],
+            summary=_text_opt(row["summary"]),
             metadata=meta,
-            error=row["error"],
+            error=_text_opt(row["error"]),
         )
 
 
@@ -2381,6 +2413,11 @@ def connect(
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
                 conn.execute("PRAGMA cell_size_check=ON")
+                # Throttled blob repair on the hot path (#997eb31b): a
+                # blob planted after this process's cold init is repaired
+                # within the throttle window instead of waiting for a
+                # process restart. COUNT probes only; no-op when clean.
+                _repair_blob_cells_throttled(conn, resolved)
                 schema_present = _schema_is_present(conn)
         except Exception:
             conn.close()
@@ -2447,6 +2484,10 @@ def connect(
                 # Surface corrupt cells as read errors instead of silent
                 # wrong-data returns.
                 conn.execute("PRAGMA cell_size_check=ON")
+                # Repair any legacy blob cells before the first read
+                # (#997eb31b) — repairs happen under the cross-process
+                # init lock, so racing processes cannot double-cast.
+                _repair_blob_cells_throttled(conn, resolved)
                 needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
@@ -3038,6 +3079,83 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             if not _is_busy_error(exc) or attempt == _BUSY_MAX_RETRIES:
                 raise
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
+
+
+
+
+# ---------------------------------------------------------------------------
+# Boot-time blob repair (#997eb31b)
+# ---------------------------------------------------------------------------
+
+# (table, column) pairs that are TEXT by schema. One BLOB cell in any of
+# them crashes JSON serialization for the ENTIRE board payload — the
+# Sep 2 incident had tasks.result bound as bytes by out-of-band SQL
+# surgery, taking the WebUI board down for every authenticated user.
+_BLOB_REPAIR_COLUMNS: tuple = (
+    ("tasks", "title"),
+    ("tasks", "body"),
+    ("tasks", "result"),
+    ("tasks", "last_failure_error"),
+    ("task_runs", "summary"),
+    ("task_runs", "error"),
+    ("task_events", "payload"),
+    ("task_comments", "body"),
+)
+
+
+def _repair_blob_cells(conn: sqlite3.Connection) -> int:
+    """CAST blob cells back to TEXT on known TEXT columns. Returns rows fixed.
+
+    Runs inside the cross-process init lock on first connect per process.
+    Best-effort and cheap: each probe is a COUNT over an indexed table's
+    rowid scan; on a healthy board every COUNT returns 0 and no write
+    transaction opens.
+    """
+    fixed = 0
+    for table, column in _BLOB_REPAIR_COLUMNS:
+        try:
+            n = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE typeof({column}) = 'blob'"
+            ).fetchone()[0]
+        except sqlite3.DatabaseError:
+            # Table/column not present in this schema vintage — skip.
+            continue
+        if n:
+            with write_txn(conn):
+                conn.execute(
+                    f"UPDATE {table} SET {column} = CAST({column} AS TEXT) "
+                    f"WHERE typeof({column}) = 'blob'"
+                )
+            fixed += int(n)
+            _log.warning(
+                "kanban blob repair: cast %d blob cell(s) in %s.%s to TEXT",
+                n, table, column,
+            )
+    return fixed
+
+
+# Throttle for the hot-reconnect sweep (#997eb31b). The cold-init path
+# always sweeps; the fast path taken by every later connect() in a
+# long-lived process (gateway dispatcher, webui server) sweeps at most
+# this often per path so connect() stays cheap on the hot loop.
+_BLOB_SWEEP_INTERVAL_S = 3600.0
+_BLOB_SWEEP_LAST: dict = {}
+
+
+def _repair_blob_cells_throttled(conn: sqlite3.Connection, resolved: str) -> None:
+    """Run _repair_blob_cells at most once per interval per resolved path.
+
+    Never raises: a failed sweep must not take connect() down with it.
+    """
+    now = time.monotonic()
+    last = _BLOB_SWEEP_LAST.get(resolved)
+    if last is not None and (now - last) < _BLOB_SWEEP_INTERVAL_S:
+        return
+    _BLOB_SWEEP_LAST[resolved] = now
+    try:
+        _repair_blob_cells(conn)
+    except Exception:
+        _log.exception("kanban blob repair sweep failed (non-fatal)")
 
 
 @contextlib.contextmanager
@@ -4340,6 +4458,9 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
+    # TEXT coercion (#997eb31b) — summary/error must never bind as BLOB.
+    summary = _text_opt(summary)
+    error = _text_opt(error)
     now = int(time.time())
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -4409,6 +4530,9 @@ def _synthesize_ended_run(
     (or for clearing it elsewhere in the same txn) since this
     function does NOT touch the tasks row.
     """
+    # TEXT coercion (#997eb31b) — summary/error must never bind as BLOB.
+    summary = _text_opt(summary)
+    error = _text_opt(error)
     now = int(time.time())
     trow = conn.execute(
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
@@ -5392,6 +5516,11 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    # TEXT coercion (#997eb31b): a bytes result/summary binds as BLOB and
+    # poisons every JSON consumer of the board payload. Coerce before any
+    # validation/branch so every downstream bind sees TEXT.
+    result = _text_opt(result)
+    summary = _text_opt(summary)
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -6187,6 +6316,9 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
+    # TEXT coercion (#997eb31b) — same rationale as complete_task.
+    result = _text_opt(result)
+    summary = _text_opt(summary)
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
