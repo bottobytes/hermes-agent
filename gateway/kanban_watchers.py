@@ -263,7 +263,24 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        # ``assignee_unreachable`` (t_09c47c8d): the dispatcher sweep found a
+        # card parked under an assignee that names no Hermes profile — no
+        # run will ever start and no other event will ever fire. This wake
+        # is the ONLY thing that breaks the silence (t_f787c53a sat 174h).
+        # ``review_spawn_starved`` (t_f0393d9f): sibling detector for the
+        # other half — a review card under a VALID profile whose reviewer
+        # never spawns (cap saturation / crash loop / review-lane wedge).
+        # Zero events before this, invisible in the WebUI (no Review column
+        # until t_084d45f9): this wake is the only silence-breaker there too.
+        # ``rate_limited`` + ``restart_orphan`` (t_e586ea59/t_39ece1cd):
+        # neutral dispatcher events — quota walls and restart orphans. They
+        # are claimed by the cursor (so they can't wedge a later
+        # completed/blocked event behind an unclaimed row) and wake with an
+        # honest cause.
+        # (Pre-t_39ece1cd this was two assignments where the second silently
+        # shadowed the first — merged into one tuple so every kind listed
+        # here actually takes effect.)
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "assignee_unreachable", "review_spawn_starved", "rate_limited", "changes_requested", "restart_orphan")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -527,6 +544,12 @@ class GatewayKanbanWatchersMixin:
                         await _to_thread_process_service(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
+                        # t_e586ea59: quota episode delivered — suppress
+                        # further rate_limited pings for this task until a
+                        # different terminal kind ends the episode (see the
+                        # _rl_episodes block above the wake-kind build).
+                        if "rate_limited" in {ev.kind for ev in d["events"]}:
+                            _rl_episodes.add(_rl_ep_key)
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
                     # Route via the SAME chokepoint the authorization path uses
@@ -562,6 +585,19 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
+                    # t_e586ea59: quota-episode suppression state. Every
+                    # cooldown retry that bounces off the same quota wall
+                    # claims ANOTHER rate_limited event; without suppression
+                    # a 5h byteplus window means ~60 pings/wakes. Deliver
+                    # once per (task, episode); any different wake kind
+                    # ends the episode. Defined before the event loop so
+                    # both the text-ping branch and the wake-kind build see
+                    # the same set.
+                    _rl_ep_key = f"{board_slug}:{sub['task_id']}:rl-episode"
+                    _rl_episodes: set = getattr(
+                        self, "_kanban_rl_episodes", None,
+                    ) or set()
+                    self._kanban_rl_episodes = _rl_episodes
                     mode = sub.get("delivery_mode") or "notify"
                     wake_agent = mode in ("notify+wake", "wake")
                     send_passive = mode != "wake"
@@ -573,6 +609,15 @@ class GatewayKanbanWatchersMixin:
                     wake_review_detail = ""
                     for ev in d["events"]:
                         kind = ev.kind
+                        # t_e586ea59: suppress repeat quota-wall pings within
+                        # one episode (see _rl_episodes above) — the text
+                        # ping is skipped entirely; the cursor still
+                        # advances past the event after the loop.
+                        if (
+                            kind == "rate_limited"
+                            and _rl_ep_key in _rl_episodes
+                        ):
+                            continue
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
@@ -616,9 +661,25 @@ class GatewayKanbanWatchersMixin:
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
+                            # t_e586ea59: lead with the honest cause when the
+                            # dispatcher classified one (provider quota /
+                            # auth / unreachable), instead of the generic
+                            # "pid gone" that made provider-quota deaths look
+                            # like worker failures.
+                            cause = ""
+                            if ev.payload:
+                                _pc = str(ev.payload.get("provider_cause") or "")
+                                _pv = str(ev.payload.get("provider") or "")
+                                _pe = str(ev.payload.get("error") or "")
+                                if _pc:
+                                    _who = f" ({_pv})" if _pv else ""
+                                    cause = (
+                                        f" — {_pc}{_who}"
+                                        + (f": {_pe[:160]}" if _pe else "")
+                                    )
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"(pid gone); dispatcher will retry{cause}"
                             )
                         elif kind == "timed_out":
                             limit = 0
@@ -686,6 +747,93 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
+                            )
+                        elif kind == "assignee_unreachable":
+                            # Dispatcher sweep (t_09c47c8d): the card is parked
+                            # under an assignee that names no Hermes profile —
+                            # no run will ever start, no other event will
+                            # fire. Without this wake the silence is unbroken
+                            # (t_f787c53a: 174h in review under 'reviewer').
+                            bad_assignee = ""
+                            park_status = ""
+                            if ev.payload:
+                                if ev.payload.get("assignee"):
+                                    bad_assignee = f"@{str(ev.payload['assignee'])}"
+                                if ev.payload.get("status"):
+                                    park_status = str(ev.payload["status"])
+                            msg = (
+                                f"🧭 {board_tag}{tag}Kanban {sub['task_id']} parked in "
+                                f"{park_status or 'queue'} under assignee {bad_assignee or '(?)'}"
+                                f" — no Hermes profile by that name exists; the dispatcher"
+                                f" will never spawn it. Reassign to a real profile"
+                                f" (`hermes profile list`) or confirm the lane."
+                            )
+                        elif kind == "review_spawn_starved":
+                            # Starvation detector (t_f0393d9f): review card
+                            # under a VALID profile whose reviewer never
+                            # spawned — per-profile cap saturation, reviewer
+                            # crash-loop, or a dispatcher review-lane wedge.
+                            # Zero events before this detector; invisible in
+                            # the WebUI until the Review column (t_084d45f9).
+                            _who = ""
+                            _mins = ""
+                            if ev.payload:
+                                if ev.payload.get("assignee"):
+                                    _who = f"@{str(ev.payload['assignee'])}"
+                                _age = ev.payload.get("age_seconds")
+                                if _age:
+                                    try:
+                                        _mins = f" for {int(_age) // 60} min"
+                                    except (TypeError, ValueError):
+                                        _mins = ""
+                            msg = (
+                                f"⏳ {board_tag}{tag}Kanban {sub['task_id']} in review"
+                                f" under {_who or '(?)'} — valid profile but no reviewer"
+                                f" spawned{_mins}. Check per-profile cap / crash loop /"
+                                f" dispatcher review lane."
+                            )
+                        elif kind == "rate_limited":
+                            # t_e586ea59: honest quota-wall notification. The
+                            # worker died to a provider quota/rate wall; the
+                            # dispatcher defers the retry until the window
+                            # clears. Surface WHO (provider) and WHY (cause)
+                            # so the creator can reassign immediately — the
+                            # decision that took a log-spelunking round on
+                            # t_86a04f09 (4 misread crashes, Aug 28).
+                            _cause = ""
+                            if ev.payload:
+                                _pc = str(ev.payload.get("provider_cause") or "")
+                                _pv = str(ev.payload.get("provider") or "")
+                                _pe = str(ev.payload.get("error") or "")
+                                if _pc:
+                                    _who = f" ({_pv})" if _pv else ""
+                                    _cause = f": {_pc}{_who}"
+                                    if _pe:
+                                        _cause += f" — {_pe[:160]}"
+                            msg = (
+                                f"🧱 {board_tag}{tag}Kanban {sub['task_id']} hit a "
+                                f"PROVIDER QUOTA WALL{_cause}; retry deferred "
+                                f"until the quota window clears"
+                            )
+                        elif kind == "restart_orphan":
+                            # t_39ece1cd: neutral restart orphan. The
+                            # dispatcher/container restarted under this
+                            # claim — the worker died WITH the box, not
+                            # from its own failure. No failure was counted
+                            # and the card was requeued; say exactly that
+                            # so a Captain-timed restart doesn't read as a
+                            # worker crash in the chat timeline.
+                            _when = ""
+                            if ev.payload and ev.payload.get("rotated_at"):
+                                try:
+                                    _when = f" at epoch rotation {int(ev.payload['rotated_at'])}"
+                                except (TypeError, ValueError):
+                                    _when = ""
+                            msg = (
+                                f"🛟 {board_tag}{tag}Kanban {sub['task_id']} was "
+                                f"orphaned by a container restart{_when} — "
+                                f"requeued with no failure counted; the "
+                                f"dispatcher respawns it next tick"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
@@ -831,6 +979,16 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
+                        # block_loop_detected must WAKE, not just text-ping:
+                        # on non-push adapters (api_server/WebUI) the text
+                        # ping is skipped above and the wake self-post IS the
+                        # delivery — without this entry the claimed event was
+                        # silently dropped (silent-triage gap, t_45f1fcc8).
+                        # (t_39ece1cd removed the duplicate _WAKE_KINDS /
+                        # quota-episode block that used to sit here — it
+                        # discarded from _wake_kinds BEFORE the set was
+                        # built one screen below. The merged, fixed block
+                        # lives below, after _wake_kinds exists.)
                         # Kinds that hand a decision back to the origin, so the
                         # origin has to take a turn. ``review_requested`` (the
                         # implementation is done and waits for a reviewer),
@@ -839,16 +997,37 @@ class GatewayKanbanWatchersMixin:
                         # (routed to triage) belong here for the same reason
                         # ``blocked`` does. ``status`` / ``archived`` /
                         # ``unblocked`` stay out: bookkeeping.
+                        # ``rate_limited`` / ``restart_orphan``
+                        # (t_e586ea59 / t_39ece1cd): neutral dispatcher
+                        # events — the creator should know (quota wall to
+                        # reassign around; restart orphan to ignore), which
+                        # on non-push adapters ONLY happens via this wake
+                        # self-post.
                         _WAKE_KINDS = (
                             "completed", "gave_up", "crashed", "timed_out",
                             "blocked", "review_requested", "changes_requested",
-                            "block_loop_detected",
+                            "block_loop_detected", "assignee_unreachable",
+                            "review_spawn_starved",
+                            "rate_limited", "restart_orphan",
                         )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                             if wake_agent
                             else set()
                         )
+                        # t_e586ea59: quota-episode gate — once an episode
+                        # has been delivered, drop rate_limited from the
+                        # wake kinds; any different wake kind ends the
+                        # episode. (t_39ece1cd: this now runs AFTER
+                        # _wake_kinds is built — the pre-patch code called
+                        # .discard() on it before assignment, a latent
+                        # NameError on the first quota episode this branch
+                        # took.)
+                        if _rl_ep_key in _rl_episodes:
+                            _wake_kinds.discard("rate_limited")
+                        for ev in d["events"]:
+                            if ev.kind != "rate_limited":
+                                _rl_episodes.discard(_rl_ep_key)
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
@@ -883,6 +1062,10 @@ class GatewayKanbanWatchersMixin:
                             if "review_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_requested"))
                             if "changes_requested" in _wake_kinds: _parts.append(t("gateway.kanban.wake.changes_requested"))
                             if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
+                            if "assignee_unreachable" in _wake_kinds: _parts.append(t("gateway.kanban.wake.assignee_unreachable"))
+                            if "review_spawn_starved" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_spawn_starved"))
+                            if "rate_limited" in _wake_kinds: _parts.append(t("gateway.kanban.wake.rate_limited"))
+                            if "restart_orphan" in _wake_kinds: _parts.append(t("gateway.kanban.wake.restart_orphan"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -1641,11 +1824,13 @@ class GatewayKanbanWatchersMixin:
             PATH, missing venv, credential loss for a real Hermes profile).
             """
             # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
+            # actually on. With ``review_dispatch`` off (an operator opt-out —
+            # the code default is ON, t_4ce2d942 verified this after the Sep 3
+            # review-lane stall was initially misattributed to the flag), a
+            # task parked in 'review' is "correctly idle" waiting for a human,
+            # not a stuck dispatcher; probing it here would fire a false
+            # "dispatcher stuck" warning that never clears. Shares the exact
+            # gate the dispatcher uses so the two can't drift.
             _review_probe = _kb.review_dispatch_enabled()
             try:
                 boards = _kb.list_boards(include_archived=False)
@@ -1815,6 +2000,47 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
+                    # t_4ce2d942: Captain-visible review-lane starvation
+                    # guard. The two dispatch-tick detectors (unreachable
+                    # sweep ~15 min, spawn-starved ~30 min) already wake
+                    # subscribers and comment on the card; these log lines
+                    # make the same signal visible in the gateway log the
+                    # Captain watches, at WARNING level so it survives the
+                    # quiet-by-default tick logging. Detectors are
+                    # episode-idempotent, so these lines fire once per
+                    # stall episode, not per tick.
+                    for slug, res in (results or []):
+                        if res is None:
+                            continue
+                        _unreach = list(getattr(res, "flagged_unreachable", None) or [])
+                        _starved = list(getattr(res, "review_spawn_starved", None) or [])
+                        if _unreach or _starved:
+                            logger.warning(
+                                "kanban dispatcher [%s]: REVIEW-LANE STALL — "
+                                "assignee_unreachable=%s review_spawn_starved=%s "
+                                "(subscribers woken; reassign or check reviewer "
+                                "profile/caps; see card comments)",
+                                slug, _unreach, _starved,
+                            )
+                    # Rate-limited early signal (≤1 per 5 min per gateway):
+                    # cards the dispatcher refuses to spawn because the
+                    # assignee names no profile. This is the exact t_82940dbf
+                    # shape (reviewer="worker", no such profile) — before the
+                    # sweep's grace elapses, this is the only visible hint.
+                    _now_ns = time.time()
+                    if _now_ns - getattr(self, "_last_nonspawnable_log", 0.0) >= 300.0:
+                        for slug, res in (results or []):
+                            if res is None:
+                                continue
+                            _nonspawn = list(getattr(res, "skipped_nonspawnable", None) or [])
+                            if _nonspawn:
+                                logger.warning(
+                                    "kanban dispatcher [%s]: %d card(s) skipped as "
+                                    "nonspawnable (assignee names no profile): %s — "
+                                    "these sit silently until reassigned",
+                                    slug, len(_nonspawn), _nonspawn,
+                                )
+                                self._last_nonspawnable_log = _now_ns
                     # Health telemetry (aggregate across boards)
                     ready_pending = await _to_thread_process_service(_ready_nonempty)
                     if ready_pending and not any_spawned:

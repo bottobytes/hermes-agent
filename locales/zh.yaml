@@ -164,6 +164,8 @@ gateway:
       completed:           "已完成"
       gave_up:             "已放弃（重试次数耗尽）"
       crashed:             "崩溃（worker 异常退出），dispatcher 将重试"
+      rate_limited:        "触发供应商配额/限流墙，配额窗口重置前暂缓重试"
+      restart_orphan:      "因容器重启成为孤儿任务；已重新入队，不计失败"
       timed_out:           "超时，dispatcher 将重试"
       blocked:             "被阻塞，需要处理"
       review_requested:    "已交付评审；实现已完成"

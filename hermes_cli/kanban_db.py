@@ -418,6 +418,261 @@ def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
 # during the launch window.
 DEFAULT_CRASH_GRACE_SECONDS = 30
 
+# Unreachable-assignee sweep (t_09c47c8d): how long a card parked in
+# ready/review/todo/triage under an assignee that names no Hermes profile
+# waits before the dispatcher sweep flags it. Terminal-lane assigns (e.g.
+# ``orion-cc`` human-pulled lanes) are expected to sit for a long time, and
+# a real human routes them promptly, so the default is deliberately slow —
+# the sweep is the backstop against silent forever-parking, not a fast
+# lint. Override via ``kanban.unreachable_assignee_grace_seconds`` or
+# ``HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS`` (0 = flag on the first tick;
+# useful for tests).
+DEFAULT_UNREACHABLE_ASSIGNEE_GRACE_SECONDS = 2 * 60 * 60  # 2 hours
+
+# t_f0393d9f: review-lane cards get a SHORT unreachable grace. Review-lane
+# assignees are machine-written by ``request_review(reviewer=...)`` and carry
+# concentrated typo/hallucination risk (t_17eb320e near-miss, t_c8191391 live
+# incident: phantom ``sdlc-review`` parked silently for 15 min before a human
+# noticed; the 2h default would have slept to ~04:35). A stuck review blocks
+# the whole lane behind it, so the wake must be fast. Override via
+# ``kanban.unreachable_assignee_grace_seconds_review`` or
+# ``HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS_REVIEW`` (0 = first tick; tests).
+DEFAULT_UNREACHABLE_ASSIGNEE_GRACE_SECONDS_REVIEW = 15 * 60  # 15 minutes
+
+# t_f0393d9f: starvation threshold for review cards whose assignee IS a real
+# profile but never spawns (per-profile cap saturation, reviewer crash-loop,
+# dispatcher review lane wedged). Before this detector that failure mode
+# produced ZERO events — fully silent (and invisible in the WebUI until the
+# Review column ships, t_084d45f9). Override via
+# ``kanban.review_spawn_starved_seconds`` or
+# ``HERMES_KANBAN_REVIEW_SPAWN_STARVED_SECONDS`` (0 = first tick; tests).
+DEFAULT_REVIEW_SPAWN_STARVED_SECONDS = 30 * 60  # 30 minutes
+
+# --- t_09c47c8d: worker-crash diagnostics (upstream #54154 pattern) --------
+# When a worker dies and the dispatcher can only record ``pid N not alive``,
+# capture the death-time evidence (worker-log tail + kernel OOM/signal
+# snippet) into a dispatcher comment on the task, so the retry worker or a
+# human can diagnose without spelunking logs. Companion classification
+# (#42289 pattern): a death whose log tail looks like FINISHED assistant
+# output ("died after the verdict, before kanban_complete") is marked
+# ``verdict_suspected`` in the crashed event and in the run error text.
+# Kill switch: HERMES_KANBAN_CRASH_DIAGNOSTICS=0/false/no/off.
+_CRASH_DIAG_TAIL_BYTES = 8192      # bytes read from the worker log
+_CRASH_DIAG_TAIL_CHARS = 6000      # chars kept in the comment
+_CRASH_DIAG_DMESG_CHARS = 1500     # chars kept from the kernel log
+_DMESG_CMD = ("dmesg", "--time-format", "iso")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_DMESG_GREP_RE = re.compile(
+    r"oom|out of memory|killed process|segfault|python", re.I
+)
+# "the run reached its final output" markers — the CLI prints a session
+# summary block (Session:/Duration:/Resume this session with) when the
+# agent loop finishes; a closing render border as the last line is the
+# weaker fallback.
+_VERDICT_TAIL_MARKERS = (
+    re.compile(r"^\s*Session:\s+\S{8,}\s*$", re.M),
+    re.compile(r"Resume this session with"),
+    re.compile(r"^\s*Duration:\s*[\dwahlsm ].*$", re.M),
+    re.compile(r"╯\s*\S{0,60}\s*$", re.M),
+)
+_VERDICT_MIN_RUN_SECONDS = 240  # below this a verdict-suspect is noise
+_SESSION_ID_RE = re.compile(r"^\s*Session:\s+(\S+)\s*$", re.M)
+
+# ---------------------------------------------------------------------------
+# t_ebde1f15: log-tail exit reclassification (cross-process exit blindness).
+#
+# In this deployment THREE dispatchers claim and spawn workers (the gateway's
+# embedded dispatcher, the WebUI's /api/kanban/dispatch bridge, and one-shot
+# ``hermes kanban dispatch`` runs from the kanban-dispatcher cron). POSIX
+# ``waitpid`` only works on a process's OWN children, and the exit-status
+# registry ``_recent_worker_exits`` is per-process memory — so a worker whose
+# spawner already exited can never be classified by ``_classify_worker_exit``
+# and every death lands in the "unknown" bucket as ``pid N not alive``.
+# Worse, workers spawned by a one-shot spawner are re-parented to PID 1,
+# which on this host is a bash script that never reaps orphans (609 zombies
+# observed) — the exit status is observable in /proc/<pid>/stat only while
+# the zombie survives, and the sweep does not read it there.
+#
+# The worker's own log tail carries the ground truth: the CLI prints a final
+# fatal-API banner ("API call failed after 3 retries … RateLimitError /
+# HTTP 429" or "quota exhausted") or a clean session-summary banner
+# (Session:/Duration:/Resume this session with:) before exiting. When the
+# exit classifier is blind we read the LAST attempt's tail (split on the
+# per-attempt "Query: work kanban task" separator — worker logs append
+# across attempts) and reclassify:
+#
+# * fatal rate-limit / quota markers  -> rate_limited (same semantics as the
+#   EX_TEMPFAIL sentinel path: no failure counted, respawn deferred by the
+#   cooldown guard). This was the killer of the long productive runs
+#   (t_09c47c8d run 3079: 57 minutes of real work, then a zai glm-5.3 429
+#   storm; t_ad490390 short bursts: Codex 30-day quota exhaustion).
+# * a clean session banner WITHOUT verdict markers -> stays in the crashed
+#   lane: the existing ``verdict_suspected`` annotation (t_09c47c8d) reads
+#   the same banner and marks the death as a lost verdict, so the retry
+#   worker surveys before rebuilding. Auto-blocking as a protocol violation
+#   instead would strand recoverable work — deliberately NOT done.
+# * anything else -> genuine abrupt death mid-attempt: keep "pid not alive"
+#   (this includes container restarts, SIGKILLs the worker never saw).
+# ---------------------------------------------------------------------------
+_WORKER_ATTEMPT_SEPARATOR_RE = re.compile(r"^Query: work kanban task.*$", re.M)
+_FATAL_API_RE = re.compile(r"API call failed after 3 retries", re.I)
+_RATE_LIMIT_FATAL_RE = re.compile(
+    r"RateLimitError|HTTP 429|quota exhausted|rate.?limit|too many requests",
+    re.I,
+)
+_SESSION_BANNER_RE = re.compile(r"^\s*Session:\s+\S{8,}\s*$", re.M)
+
+# ---------------------------------------------------------------------------
+# t_e586ea59: honest provider-death classification. A worker whose provider
+# API calls are refused (quota exhausted / auth dead / endpoint unreachable)
+# exits rc=0 on the -q path and used to land in the protocol-violation lane —
+# blame the provider, not the worker. These regexes extract WHO (provider) and
+# WHY (quota vs auth vs unreachable) from the same log tail the t_ebde1f15
+# reroute already reads, so classification stays a pure function of text.
+# ---------------------------------------------------------------------------
+# "🔌 Provider: byteplus  Model: glm-5.2" — the CLI prints this on every API
+# failure banner. Whitespace-tolerant; the emoji is optional in the match.
+_PROVIDER_LINE_RE = re.compile(
+    r"Provider:\s*([A-Za-z0-9_.\- ]+?)\s*(?:Model:|$)", re.I,
+)
+# Quota walls: 429 family + explicit quota-plan language. Ordered so the more
+# specific AccountQuotaExceeded-style markers are checked first only for
+# REPORTING detail; membership is a plain boolean.
+_PROVIDER_QUOTA_RE = re.compile(
+    r"\b(429|RateLimitError|quota|rate.?limit|too many requests|"
+    r"AccountQuotaExceeded|InsufficientBalance|billing)\b",
+    re.I,
+)
+# Auth failures: bad/expired key, forbidden plan.
+_PROVIDER_AUTH_RE = re.compile(
+    r"\b(401|403|invalid[ _]api[ _]key|unauthorized|forbidden|"
+    r"authentication|permission denied)\b",
+    re.I,
+)
+# Unreachable provider: connection-level failures after retries.
+_PROVIDER_UNREACHABLE_RE = re.compile(
+    r"\b(connection (?:refused|reset|timed? ?out|error)|ECONNREFUSED|"
+    r"ECONNRESET|ETIMEDOUT|ENOTFOUND|name or service not known|"
+    r"service unavailable|502|503|504|overloaded)\b",
+    re.I,
+)
+
+
+def _provider_from_tail(seg: str) -> str:
+    """Extract the provider name from the last failure banner in ``seg``.
+
+    The CLI's API-failure banner prints ``Provider: <name>  Model: <model>``
+    right under the error line; the LAST match wins (closest to death).
+    Returns ``""`` when no banner is present (older formats, stripped logs).
+    """
+    if not seg:
+        return ""
+    matches = _PROVIDER_LINE_RE.findall(seg)
+    if not matches:
+        return ""
+    name = matches[-1].strip().rstrip(".,;:")
+    return name[:40]
+
+
+def _classify_provider_death(seg: str) -> "tuple[str, str]":
+    """Classify the CAUSE of a provider-API death from a log-tail segment.
+
+    Returns ``(cause_tag, provider)`` where ``cause_tag`` is one of
+    ``"provider-quota-exhausted"``, ``"provider-auth-failed"``,
+    ``"provider-unreachable"``, or ``""`` when the segment shows no provider
+    error at all (a genuine protocol violation or abrupt death — keep the
+    existing lanes). Quota is checked first: a 429 storm that eventually
+    surfaces as something else still started as a quota wall.
+
+    Pure text heuristics over the last attempt's tail; never raises.
+    """
+    try:
+        if not seg:
+            return ("", "")
+        provider = _provider_from_tail(seg)
+        if _PROVIDER_QUOTA_RE.search(seg):
+            return ("provider-quota-exhausted", provider)
+        if _PROVIDER_AUTH_RE.search(seg):
+            return ("provider-auth-failed", provider)
+        if _PROVIDER_UNREACHABLE_RE.search(seg):
+            return ("provider-unreachable", provider)
+        return ("", provider)
+    except Exception:
+        return ("", "")
+
+
+def _worker_attempt_tail(tail: str) -> str:
+    """Return only the last attempt's slice of a worker-log tail.
+
+    Worker logs are opened in append mode (a re-run on unblock appends, not
+    overwrites), so an 8 KB tail window can straddle two attempts. The
+    session banner of attempt N-1 must never be read as attempt N's exit
+    banner — split on the per-attempt query separator and keep the last
+    segment.
+    """
+    if not tail:
+        return ""
+    parts = _WORKER_ATTEMPT_SEPARATOR_RE.split(tail)
+    return parts[-1] if parts else tail
+
+
+def _tail_shows_rate_limit(tail: str) -> bool:
+    """True when the last attempt's log tail shows a fatal quota wall.
+
+    Matches both banner shapes observed in the fleet:
+    * the retry-exhaustion banner — "API call failed after 3 retries" plus
+      a rate-limit indicator (RateLimitError / HTTP 429 / retry-after) —
+      the zai glm-5.3 429 storms that killed the long productive runs; and
+    * the Codex quota bail — "quota exhausted (429); retry after Ns" —
+      which prints its own banner without the retry-exhaustion line.
+    """
+    try:
+        seg = _worker_attempt_tail(tail or "")
+        if not seg:
+            return False
+        if _FATAL_API_RE.search(seg) and _RATE_LIMIT_FATAL_RE.search(seg):
+            return True
+        # Codex quota bail — distinctive banner shape
+        # ("... quota exhausted (429); retry after Ns ..."). The (429)
+        # parenthetical + retry-after keeps worker PROSE that merely
+        # discusses quota exhaustion from matching.
+        if re.search(r"quota exhausted \(429\).*retry after", seg, re.I):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _reclassify_blind_exit(tail: str) -> str:
+    """Classify an unclassifiable (unknown-exit) worker death from its log.
+
+    Returns one of ``"rate_limited"``, ``"clean_exit"``, or ``"unknown"``.
+    Pure text heuristics over the last attempt's tail; never raises.
+    """
+    try:
+        seg = _worker_attempt_tail(tail or "")
+        if not seg:
+            return "unknown"
+        if _FATAL_API_RE.search(seg) and _RATE_LIMIT_FATAL_RE.search(seg):
+            return "rate_limited"
+        # Codex quota bail prints its own banner without the retry-exhaustion
+        # line ("quota exhausted (429); retry after Ns") — unambiguous quota
+        # wall, classify it as rate_limited too (t_ad490390 bursts). The
+        # distinctive shape guards against worker prose false-positives.
+        if re.search(r"quota exhausted \(429\).*retry after", seg, re.I):
+            return "rate_limited"
+        if _SESSION_BANNER_RE.search(seg):
+            return "clean_exit"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _crash_diagnostics_enabled() -> bool:
+    """HERMES_KANBAN_CRASH_DIAGNOSTICS kill switch (default: enabled)."""
+    raw = os.environ.get("HERMES_KANBAN_CRASH_DIAGNOSTICS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
 
 # Sentinel exit code a kanban worker uses to signal "I bailed because the
 # provider rate-limited / exhausted quota, not because the task failed."
@@ -1775,6 +2030,12 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+CREATE TABLE IF NOT EXISTS task_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -4904,6 +5165,516 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def reconcile_missing_terminal_events(
+    conn: sqlite3.Connection, *, grace_seconds: int = 300
+) -> int:
+    """Self-heal ``done`` tasks whose terminal ``completed`` event is missing.
+
+    The wake pipeline (gateway watchers + WebUI kanban-notifier plugin) keys
+    exclusively off ``task_events`` rows — a task flipped to ``done`` without
+    a ``completed`` event is invisible to every notifier, so the creating
+    session is never woken and mission chains stall silently (t_5e71675d /
+    run 3056 on t_2ce22807, closed by a delegate child's hand-rolled SQL
+    UPDATE that skipped the event insert).
+
+    This reconciler is the belt-and-braces backstop for ANY writer that
+    bypasses :func:`complete_task`: for every ``done``/``archived`` task with
+    no ``completed`` event whose ``completed_at`` is older than
+    ``grace_seconds`` (so a legitimately in-flight completion txn is never
+    double-written), it synthesizes the missing event from the closing run's
+    handoff — same payload shape ``complete_task`` writes, so downstream
+    consumers (wake prompts, artifact uploads) behave identically.
+
+    Idempotent: tasks that already have the event are skipped. Returns the
+    number of events synthesized. Called from the dispatcher tick, so it runs
+    under the board's dispatch lock and never concurrently with itself.
+    """
+    now = int(time.time())
+    cutoff = now - int(grace_seconds)
+    rows = conn.execute(
+        """
+        SELECT t.id, t.completed_at, t.result,
+               (SELECT r.id FROM task_runs r
+                 WHERE r.task_id = t.id AND r.outcome = 'completed'
+                 ORDER BY COALESCE(r.ended_at, r.started_at, 0) DESC, r.id DESC
+                 LIMIT 1) AS completed_run_id,
+               (SELECT r.summary FROM task_runs r
+                 WHERE r.task_id = t.id AND r.outcome = 'completed'
+                 ORDER BY COALESCE(r.ended_at, r.started_at, 0) DESC, r.id DESC
+                 LIMIT 1) AS completed_run_summary
+          FROM tasks t
+         WHERE t.status IN ('done', 'archived')
+           AND t.completed_at IS NOT NULL
+           AND t.completed_at <= ?
+           AND NOT EXISTS (
+               SELECT 1 FROM task_events e
+                WHERE e.task_id = t.id AND e.kind = 'completed'
+           )
+        """,
+        (cutoff,),
+    ).fetchall()
+    if not rows:
+        return 0
+    synthesized = 0
+    for row in rows:
+        run_id = int(row["completed_run_id"]) if row["completed_run_id"] else None
+        summary_src = (
+            row["completed_run_summary"] if row["completed_run_summary"] else row["result"]
+        )
+        ev_lines = (summary_src or "").strip().splitlines()
+        ev_summary = ev_lines[0][:400] if ev_lines else ""
+        payload = {
+            "result_len": len(row["result"]) if row["result"] else 0,
+            "summary": ev_summary or None,
+            "synthesized_by": "reconcile_missing_terminal_events",
+            "synthesized_at": now,
+            "task_completed_at": int(row["completed_at"]),
+        }
+        with write_txn(conn):
+            # Re-check inside the txn: another writer may have inserted the
+            # event between the SELECT above and now.
+            exists = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'completed'",
+                (row["id"],),
+            ).fetchone()
+            if exists:
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "completed",
+                payload,
+                run_id=run_id,
+            )
+        synthesized += 1
+    if synthesized:
+        _log.warning(
+            "kanban: reconciler synthesized %d missing 'completed' event(s)",
+            synthesized,
+        )
+    return synthesized
+
+
+def _resolve_unreachable_grace_seconds(
+    *, status: Optional[str] = None,
+) -> int:
+    """Grace window for the unreachable-assignee sweep (seconds).
+
+    ``HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS`` env wins, then
+    ``kanban.unreachable_assignee_grace_seconds`` in config.yaml, then the
+    2-hour default. ``0`` flags on the first eligible tick (tests). Negative
+    values fall through to the default.
+
+    t_f0393d9f — status-aware short lane: when ``status='review'`` the
+    resolution order instead prefers ``HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS_REVIEW``
+    env → ``kanban.unreachable_assignee_grace_seconds_review`` config → the
+    15-minute default. Review-lane assignees are machine-written by
+    ``request_review(reviewer=...)`` (typo/hallucination risk concentrated
+    there — t_c8191391) and a stuck review card blocks the lane, so the
+    wake must arrive in minutes, not hours. A missing/invalid review-lane
+    override falls back to the SAME order as the generic lane (env → config
+    → 2h default) — never to the generic lane's raw default directly, so an
+    operator who sets only the generic knobs still controls both lanes.
+    All other statuses (ready/todo/triage) keep the generic 2h behaviour
+    unchanged (regression-guarded by tests).
+    """
+    lane_env = (
+        "HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS_REVIEW"
+        if status == "review"
+        else "HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS"
+    )
+    lane_cfg_key = (
+        "unreachable_assignee_grace_seconds_review"
+        if status == "review"
+        else "unreachable_assignee_grace_seconds"
+    )
+    lane_default = (
+        DEFAULT_UNREACHABLE_ASSIGNEE_GRACE_SECONDS_REVIEW
+        if status == "review"
+        else DEFAULT_UNREACHABLE_ASSIGNEE_GRACE_SECONDS
+    )
+    raw = os.environ.get(lane_env, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("kanban", {}) or {}
+        cfg_val = cfg.get(lane_cfg_key)
+        if cfg_val is not None:
+            parsed = int(cfg_val)
+            if parsed >= 0:
+                return parsed
+        # Review lane with no review-specific knob set: fall back to the
+        # GENERIC lane's env/config (NOT its 2h default) so shared knobs
+        # still steer both lanes — then the short review default.
+        if status == "review":
+            generic_raw = os.environ.get(
+                "HERMES_KANBAN_UNREACHABLE_GRACE_SECONDS", ""
+            ).strip()
+            if generic_raw:
+                try:
+                    parsed = int(generic_raw)
+                except ValueError:
+                    parsed = -1
+                if parsed >= 0:
+                    return parsed
+            generic_cfg = cfg.get("unreachable_assignee_grace_seconds")
+            if generic_cfg is not None:
+                parsed = int(generic_cfg)
+                if parsed >= 0:
+                    return parsed
+    except Exception:
+        pass
+    return lane_default
+
+
+def _dispatch_profile_exists(name: str) -> Optional[bool]:
+    """Resolve ``hermes_cli.profiles.profile_exists`` defensively.
+
+    Returns ``None`` when the profiles module is unavailable (test stubs,
+    exotic envs) — callers must treat that as "unknown", never "missing":
+    the dispatcher loops use the same fallback and would otherwise spawn
+    against a profile that exists but can't be resolved here.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        return None
+    try:
+        return bool(profile_exists(name))
+    except Exception:
+        return None
+
+
+def reconcile_stuck_assignees(
+    conn: sqlite3.Connection, *, grace_seconds: Optional[int] = None
+) -> list[str]:
+    """Flag cards parked under an assignee that names no Hermes profile.
+
+    The dispatcher loops intentionally skip non-profile assignees
+    (``skipped_nonspawnable``): terminal lanes like ``orion-cc`` are
+    human-pulled via ``claim_task`` and must never auto-spawn. But the same
+    skip silently parks a card FOREVER when the assignee is simply wrong —
+    a hallucinated reviewer on ``request_review`` (t_17eb320e near-miss) or
+    a typo'd profile on create. Nothing marked the card, nothing woke the
+    creator: t_f787c53a sat in ``review`` under assignee ``reviewer`` for
+    174h before a human noticed (t_09c47c8d).
+
+    This sweep — the t_5e71675d dispatcher-tick self-healing pattern — is
+    the belt-and-braces backstop. For every card in ready/review/todo/triage
+    whose assignee resolves to no profile, older than ``grace_seconds``
+    (age taken from the row's latest lifecycle event, so a just-reassigned
+    card restarts the clock) and not already flagged (idempotent via the
+    ``assignee_unreachable`` event), it writes:
+
+    * an ``assignee_unreachable`` event — in the notifier terminal sets of
+      BOTH wake paths (gateway watcher + WebUI kanban-notifier plugin), so
+      the card's subscriber is pinged/woken exactly once via the existing
+      cursor/event-id dedup, and
+    * a visible board comment, so anyone reading the card sees why it is
+      parked without opening the event log.
+
+    The card is NOT blocked or reassigned — the sweep cannot guess intent
+    (a terminal lane vs a typo look identical on disk). Routing is a human
+    or orchestrator decision; the sweep only guarantees the silence is
+    broken. Cards go back to normal the moment the assignee is fixed (or a
+    matching profile appears): a subsequent run under a real profile
+    leaves no further flagged rows and the next flagged-card check skips
+    the task entirely (event exists → idempotent short-circuit).
+
+    Runs under the board's dispatch lock inside the dispatcher tick, so it
+    never races itself. Returns the task ids flagged this pass.
+    """
+    explicit_grace = grace_seconds is not None
+    if grace_seconds is None:
+        grace_seconds = _resolve_unreachable_grace_seconds()
+    exists_fn = _dispatch_profile_exists
+    if exists_fn is None:
+        # Can't happen via _dispatch_profile_exists (it returns Optional[bool]),
+        # but keep the fail-open guard for future callers passing a stub.
+        return []
+
+    now = int(time.time())
+    rows = conn.execute(
+        """
+        SELECT t.id, t.assignee, t.status, t.title,
+               COALESCE(
+                   (SELECT MAX(e.created_at) FROM task_events e
+                     WHERE e.task_id = t.id), t.created_at
+               ) AS last_event_ts
+          FROM tasks t
+         WHERE t.status IN ('ready', 'review', 'todo', 'triage')
+           AND t.assignee IS NOT NULL
+           AND TRIM(t.assignee) != ''
+           AND t.assignee != 'default'
+           AND NOT EXISTS (
+               SELECT 1 FROM task_events f
+                WHERE f.task_id = t.id AND f.kind = 'assignee_unreachable'
+           )
+        """
+    ).fetchall()
+    flagged: list[str] = []
+    for row in rows:
+        assignee = row["assignee"]
+        resolved = exists_fn(assignee) if exists_fn else None
+        if resolved is not False:
+            # Real profile, or unverifiable (profiles module unavailable) —
+            # never flag on "unknown", only on a verified miss.
+            continue
+        try:
+            age = now - int(row["last_event_ts"] or 0)
+        except (TypeError, ValueError):
+            continue
+        # t_f0393d9f: status-aware grace. review cards use the short
+        # review-lane grace (15 min default) — machine-written reviewers +
+        # lane-blocking make the 2h wait unacceptable there. The caller's
+        # explicit ``grace_seconds`` (tests, CLI) still wins for every lane.
+        if explicit_grace or row["status"] != "review":
+            row_grace = grace_seconds
+        else:
+            row_grace = _resolve_unreachable_grace_seconds(status="review")
+        if age < row_grace:
+            continue
+        # Re-check idempotency inside the txn: another writer may have
+        # flagged this card between the SELECT above and now.
+        with write_txn(conn):
+            already = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND kind = 'assignee_unreachable'",
+                (row["id"],),
+            ).fetchone()
+            if already:
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "assignee_unreachable",
+                {
+                    "assignee": assignee,
+                    "status": row["status"],
+                    "age_seconds": age,
+                    "flagged_by": "reconcile_stuck_assignees",
+                },
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    row["id"],
+                    "dispatcher",
+                    (
+                        f"⚠️ Assignee @{assignee} does not match any Hermes "
+                        f"profile — this card is parked in '{row['status']}' "
+                        f"and the dispatcher will never spawn it "
+                        f"(silent for {age // 3600}h"
+                        + (
+                            f", {(age % 3600) // 60}m"
+                            if age % 3600 and row["status"] == "review"
+                            else ""
+                        )
+                        + "). Reassign to a real "
+                        f"profile (see `hermes profile list`) or confirm "
+                        f"the terminal lane; without action it stays "
+                        f"parked indefinitely (sweep t_09c47c8d)."
+                    ),
+                    now,
+                ),
+            )
+            flagged.append(row["id"])
+    if flagged:
+        _log.warning(
+            "kanban: unreachable-assignee sweep flagged %d card(s): %s",
+            len(flagged), ", ".join(flagged),
+        )
+    return flagged
+
+
+def _resolve_review_spawn_starved_seconds() -> int:
+    """Threshold for the review-spawn-starvation detector (seconds).
+
+    ``HERMES_KANBAN_REVIEW_SPAWN_STARVED_SECONDS`` env wins, then
+    ``kanban.review_spawn_starved_seconds`` in config.yaml, then the
+    30-minute default. ``0`` flags on the first eligible tick (tests).
+    Negative values fall through to the default.
+    """
+    raw = os.environ.get("HERMES_KANBAN_REVIEW_SPAWN_STARVED_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    try:
+        from hermes_cli.config import load_config
+
+        cfg_val = (
+            (load_config() or {}).get("kanban", {}) or {}
+        ).get("review_spawn_starved_seconds")
+        if cfg_val is not None:
+            parsed = int(cfg_val)
+            if parsed >= 0:
+                return parsed
+    except Exception:
+        pass
+    return DEFAULT_REVIEW_SPAWN_STARVED_SECONDS
+
+
+# Events that re-arm the starvation detector for a new episode: a fresh
+# review handoff (review_requested), an explicit routing change (assigned),
+# or a reviewer that actually claimed the card (claimed — the lane worked
+# once; if the claim later goes stale and nothing re-spawns, that is a NEW
+# episode worth waking on, not a repeat of the old one).
+_REVIEW_STARVE_REARM_KINDS = ("review_requested", "assigned", "claimed")
+
+
+def detect_review_spawn_starved(
+    conn: sqlite3.Connection, *, threshold_seconds: Optional[int] = None
+) -> list[str]:
+    """Flag review cards whose VALID reviewer never spawns (t_f0393d9f).
+
+    The unreachable-assignee sweep (t_09c47c8d) covers the phantom-assignee
+    half of the frozen-review gap. This detector covers the other, previously
+    BLIND half: a card parked in ``review`` under a REAL profile that never
+    spawns — reviewer at its per-profile cap, crash-looping before the first
+    event, or a dispatcher review lane wedge. Those failures produce ZERO
+    events (cap deferral writes ``skipped_per_profile_capped`` to the
+    DispatchResult only — nothing durable), the card cannot appear in the
+    WebUI until the Review column ships (t_084d45f9), so the silence is
+    total.
+
+    Criteria per card: ``status='review'``, ``claim_lock IS NULL``,
+    assignee verifies as a real Hermes profile, and no lifecycle event for
+    more than ``threshold_seconds`` (age from the row's latest event; ticks
+    write no events, so an unspawned card's age only grows). When it fires:
+
+    * a ``review_spawn_starved`` event — registered in the notifier
+      terminal sets of BOTH wake paths (gateway watcher + WebUI
+      kanban-notifier plugin), so the card's subscriber is woken exactly
+      once via the existing cursor/event-id dedup, and
+    * a visible board comment naming the three usual suspects (per-profile
+      cap / crash loop / dispatcher review lane).
+
+    Idempotent per episode, mirroring the rate-limit cooldown pattern: once
+    fired, it does NOT re-fire until a NEW re-arm event
+    (``review_requested`` / ``assigned`` / ``claimed``) restarts the
+    episode — no per-tick spam. The card is NOT blocked or reassigned;
+    routing stays a human/orchestrator decision (the same posture as the
+    unreachable sweep). A reviewer that eventually spawns flips the card to
+    ``running`` and the detector stops considering it entirely.
+
+    Runs under the board's dispatch lock inside the dispatcher tick, so it
+    never races itself. Returns the task ids flagged this pass.
+    """
+    if threshold_seconds is None:
+        threshold_seconds = _resolve_review_spawn_starved_seconds()
+    exists_fn = _dispatch_profile_exists
+
+    now = int(time.time())
+    rows = conn.execute(
+        """
+        SELECT t.id, t.assignee, t.title,
+               COALESCE(
+                   (SELECT MAX(e.created_at) FROM task_events e
+                     WHERE e.task_id = t.id), t.created_at
+               ) AS last_event_ts,
+               COALESCE(
+                   (SELECT MAX(r.id) FROM task_events r
+                     WHERE r.task_id = t.id
+                       AND r.kind IN ('review_requested', 'assigned', 'claimed')),
+                   0
+               ) AS rearm_event_id
+          FROM tasks t
+         WHERE t.status = 'review'
+           AND t.claim_lock IS NULL
+           AND t.assignee IS NOT NULL
+           AND TRIM(t.assignee) != ''
+           AND t.assignee != 'default'
+        """
+    ).fetchall()
+    flagged: list[str] = []
+    for row in rows:
+        assignee = row["assignee"]
+        resolved = exists_fn(assignee)
+        if resolved is not True:
+            # Not a verified-real profile: the unreachable sweep owns that
+            # half (verified miss) and "unknown" must never fire either
+            # detector (fail-open, same posture as reconcile_stuck_assignees).
+            continue
+        try:
+            age = now - int(row["last_event_ts"] or 0)
+        except (TypeError, ValueError):
+            continue
+        if age < threshold_seconds:
+            continue
+        rearm_id = int(row["rearm_event_id"] or 0)
+        # Episode idempotency: a starve event newer than the latest re-arm
+        # event means this episode already woke the subscriber.
+        already = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_spawn_starved' AND id > ?",
+            (row["id"], rearm_id),
+        ).fetchone()
+        if already:
+            continue
+        # Re-check inside the txn: another writer may have flagged this
+        # card (or a reviewer may have claimed it) between SELECT and now.
+        with write_txn(conn):
+            still = conn.execute(
+                "SELECT 1 FROM tasks "
+                "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+                (row["id"],),
+            ).fetchone()
+            if not still:
+                continue
+            already = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_spawn_starved' AND id > ?",
+                (row["id"], rearm_id),
+            ).fetchone()
+            if already:
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "review_spawn_starved",
+                {
+                    "assignee": assignee,
+                    "age_seconds": age,
+                    "threshold_seconds": threshold_seconds,
+                    "flagged_by": "detect_review_spawn_starved",
+                },
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    row["id"],
+                    "dispatcher",
+                    (
+                        f"⚠️ Reviewer @{assignee} is a valid profile but has not "
+                        f"spawned for {age // 60} min — check per-profile cap / "
+                        f"crash loop / dispatcher review lane (starvation "
+                        f"detector t_f0393d9f)."
+                    ),
+                    now,
+                ),
+            )
+            flagged.append(row["id"])
+    if flagged:
+        _log.warning(
+            "kanban: review-spawn-starved detector flagged %d card(s): %s",
+            len(flagged), ", ".join(flagged),
+        )
+    return flagged
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -7182,15 +7953,18 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked`, or `triage` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
-    entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    entry. ``triage`` is accepted (t_45f1fcc8) as the structured exit for
+    a block-loop escalation an operator has reviewed — same rationale as
+    ``unblock_task`` accepting triage. Refuses to promote if any parent
+    dep is not in a terminal state (`done`/`archived`) unless
+    ``force=True``. Does NOT change assignee or claim state. Returns
+    ``(True, None)`` on success and ``(False, reason)`` if refused.
+    ``dry_run=True`` validates the promotion would succeed without
+    mutating state.
     """
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -7199,10 +7973,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "triage"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked', or 'triage'"
         )
 
     if not force:
@@ -7228,7 +8002,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'triage')",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -7293,7 +8067,15 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` to its safe resumable phase.
+    """Transition ``blocked``/``scheduled``/``triage`` to its safe resumable phase.
+
+    ``triage`` is included (t_45f1fcc8): a block-loop escalation parks the
+    task for a human decision, and once that decision is "the blocker is
+    resolved, continue", ``kanban_unblock`` must be the structured exit —
+    otherwise orchestrators reach for raw sqlite UPDATEs. Semantics are the
+    same as unblocking from ``blocked``: the ``block_recurrences`` counter
+    deliberately SURVIVES (see below), so if the worker re-blocks for the
+    same cause it routes straight back to triage instead of spinning.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -7310,11 +8092,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if current and current["status"] == "blocked"
+            if current and current["status"] in ("blocked", "triage")
             else "ready"
         )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
             note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
@@ -7337,7 +8119,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
@@ -8438,6 +9220,20 @@ class DispatchResult:
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
     dead/gone worker). See the reconciliation pass for details."""
+    flagged_unreachable: list[str] = field(default_factory=list)
+    """Task ids flagged by :func:`reconcile_stuck_assignees` this tick —
+    cards parked in ready/review/todo/triage under an assignee that names
+    no Hermes profile. Each got an ``assignee_unreachable`` event (wakes
+    the card's subscriber) + a dispatcher comment. NOT auto-blocked —
+    routing is a human/orchestrator decision (a terminal lane and a typo
+    look identical on disk). Empty on every subsequent tick (idempotent)."""
+    review_spawn_starved: list[str] = field(default_factory=list)
+    """Task ids flagged by :func:`detect_review_spawn_starved` this tick —
+    review cards under a VALID profile assignee that never spawned (cap
+    saturation / crash loop / review-lane wedge). Each got a
+    ``review_spawn_starved`` event (wakes the card's subscriber) + a
+    dispatcher comment. Idempotent per episode: empty until a new
+    review_requested/assigned/claimed event re-arms it (t_f0393d9f)."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -8491,6 +9287,12 @@ class DispatchResult:
     close, these resume on the next tick."""
     restart_window_hold: bool = False
     """True when this tick held spawns because a restart window was open."""
+    restart_orphans: list[str] = field(default_factory=list)
+    """Task ids whose in-flight claims died with a dispatcher/container
+    restart (not with their own failure) and were requeued WITHOUT counting
+    a failure (t_39ece1cd). Same neutral semantics as ``rate_limited``:
+    no failure tick, no auto-block — the next tick respawns them normally."""
+
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -9271,7 +10073,221 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+
+
+# t_39ece1cd: restart-orphan handling — the last gap of the crash-accounting
+# family. Two live incidents (2026-08-29):
+#   * 03:45 container restart: first tick crash-marked in-flight claims
+#     (runs 3139/3140 — "crashed", failure ticks + auto-blocks) even though
+#     the restart, not the workers, killed them; one sibling (run 3149)
+#     survived the restart entirely.
+#   * 03:01 host kill: run 3127 was crash-marked while its worker kept
+#     executing (ghost); the dispatcher spawned run 3139 on top and the two
+#     runs had to self-coordinate via card comments.
+# Mechanisms:
+#   * restart epoch — a monotonic token persisted in task_meta; rotated by
+#     each dispatcher process identity change. Deaths observed on the first
+#     pass(es) after a rotation, whose claims were made under a prior epoch
+#     and are not in this process's exit registry, classify as
+#     ``restart_orphan``: a NEUTRAL kind (like rate_limited) — no failure
+#     tick, no auto-block, honest requeue with an explanatory event.
+#   * wait-and-adopt — before respawn (and before crash-marking), a claim
+#     whose PID is ALIVE on this host is never reclaimed: the claim is
+#     extended and the run adopted (surviving cross-restart workers keep
+#     their bookkeeping instead of racing a double-spawn).
+DEFAULT_RESTART_ORPHAN_WINDOW_SECONDS = 120
+# How long after an epoch rotation deaths may qualify as restart orphans.
+# The first dispatcher tick after a restart lands within one tick interval
+# (~60s here); 120s covers a slow tick plus the crash grace without
+# stretching into "genuine mid-flight crash shortly after a restart"
+# territory (those still classify honestly as crashed).
+
+def _resolve_restart_orphan_window_seconds() -> int:
+    """Return the restart-orphan qualification window in seconds.
+
+    Reads ``HERMES_KANBAN_RESTART_ORPHAN_WINDOW_SECONDS``; falls back to
+    ``DEFAULT_RESTART_ORPHAN_WINDOW_SECONDS`` when absent/invalid. ``0``
+    disables the neutral lane (deaths after a rotation classify as they
+    always did) — useful for A/B tests and incident rollbacks.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_RESTART_ORPHAN_WINDOW_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_RESTART_ORPHAN_WINDOW_SECONDS
+
+
+_RESTART_EPOCH_META_KEY = "restart_epoch"
+
+
+def _read_meta(conn: sqlite3.Connection, key: str) -> "tuple[Optional[str], Optional[int]]":
+    """Return ``(value, updated_at)`` for a task_meta key, or ``(None, None)``.
+
+    Best-effort: on any sqlite error (missing table on a legacy DB mid-
+    migration, locked DB) returns ``(None, None)`` so callers treat the
+    state as absent rather than raising inside a reclaim txn.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value, updated_at FROM task_meta WHERE key = ?", (key,),
+        ).fetchone()
+    except sqlite3.Error:
+        return (None, None)
+    if row is None:
+        return (None, None)
+    return (row["value"] if "value" in row.keys() else row[0],
+            row["updated_at"] if "updated_at" in row.keys() else row[1])
+
+
+def _write_meta(conn: sqlite3.Connection, key: str, value) -> None:
+    """Upsert a task_meta row. Best-effort; sqlite errors are swallowed.
+
+    Called from inside an open write txn (schema guarantees the table via
+    CREATE TABLE IF NOT EXISTS on every fresh connect; a legacy DB that has
+    not run the additive migration yet simply skips epoch bookkeeping this
+    tick — the neutral lane degrades to stock behaviour, never crashes).
+    """
+    try:
+        conn.execute(
+            "INSERT INTO task_meta (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (key, json.dumps(value, ensure_ascii=False), int(time.time())),
+        )
+    except sqlite3.Error:
+        pass
+
+
+def _restart_epoch_state(
+    conn: sqlite3.Connection, *, dispatcher_id: "Optional[str]" = None,
+) -> "tuple[Optional[int], int]":
+    """Rotate/return the persisted restart epoch. Returns (epoch, rotated_at).
+
+    ``epoch`` is a process-identity-derived monotonic counter persisted in
+    task_meta (DB survives the restart; the counter increments across it).
+    Returns ``(None, 0)`` when persistence is unavailable (legacy schema /
+    locked DB) — callers then skip all restart-orphan logic.
+
+    Identity = ``dispatcher_id`` or ``_claimer_id()`` (``host:pid``). When
+    the persisted epoch row was written by a DIFFERENT process identity,
+    this is a (re)start of the dispatching process: bump the counter, stamp
+    ``rotated_at``, and persist both. Same identity → no-op read.
+    """
+    who = dispatcher_id or _claimer_id()
+    now = int(time.time())
+    try:
+        row = conn.execute(
+            "SELECT value, updated_at FROM task_meta "
+            "WHERE key = ?", (_RESTART_EPOCH_META_KEY,),
+        ).fetchone()
+    except sqlite3.Error:
+        return (None, 0)
+    if row is not None:
+        try:
+            state = json.loads(row["value"]) if row["value"] else {}
+        except (ValueError, TypeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        if state.get("owner") == who:
+            return (int(state.get("epoch") or 0), int(state.get("rotated_at") or 0))
+        # New dispatcher identity → rotation. Monotonic across restarts.
+        new_epoch = int(state.get("epoch") or 0) + 1
+        rotated_at = now
+    else:
+        # Bootstrap (no prior row): the epoch began "at the dawn of time".
+        # A first-ever row MUST NOT stamp rotated_at = now — every in-flight
+        # claim on the board would suddenly predate the "rotation" and a
+        # dead-pid pass would neutral-requeue genuine crashes (caught by the
+        # t_e586ea59 regression suite). Only a genuine identity CHANGE
+        # (restart) opens the orphan window.
+        new_epoch = 1
+        rotated_at = 0
+    state = {"owner": who, "epoch": new_epoch, "rotated_at": rotated_at}
+    _write_meta(conn, _RESTART_EPOCH_META_KEY, state)
+    return (new_epoch, rotated_at)
+
+
+def _adopt_one_live_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    claim_lock: "Optional[str]",
+    *,
+    epoch: int,
+    rotated_at: int,
+) -> bool:
+    """Adopt a pre-rotation claim whose worker PID is still alive (t_39ece1cd).
+
+    Called INSIDE detect_crashed_workers' write txn when a claim that
+    started under a prior restart epoch still has a live worker on this
+    host — the 03:01 incident shape (run 3127: crash-marked claim, worker
+    still executing, successor double-spawned on top). Adoption:
+
+    * extends the claim TTL (the worker's heartbeats will keep it alive;
+      a fresh ``claim_expires`` bridges the gap until the next beat),
+    * keeps ``worker_pid`` / ``claim_lock`` intact (no respawn race),
+    * stamps one ``adopted`` event per epoch rotation per task (dedup via
+      the event payload epoch) so the board explains the cross-restart
+      survival instead of the card silently sitting in ``running``.
+
+    Heartbeat staleness remains the backstop: if the survivor is wedged
+    (no heartbeat for DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS),
+    ``release_stale_claims`` reclaims it exactly as before — adoption only
+    defers to OBSERVABLY LIVE workers, never to zombies (and _pid_alive's
+    zombie probe already excludes reaped children).
+
+    Returns True when the claim was extended.
+    """
+    now = int(time.time())
+    new_expires = now + _resolve_claim_ttl_seconds()
+    cur = conn.execute(
+        "UPDATE tasks SET claim_expires = ? "
+        "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+        (new_expires, task_id, claim_lock),
+    )
+    if cur.rowcount != 1:
+        return False
+    run_id = _current_run_id(conn, task_id)
+    if run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+            (new_expires, run_id),
+        )
+    # One adopted event per (task, epoch): the next dispatcher tick after
+    # adoption sees started_at < rotated_at still true, and re-adopting
+    # would spam the event log for the whole orphan window.
+    dup = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'adopted' "
+        "AND json_extract(payload, '$.epoch') = ? LIMIT 1",
+        (task_id, int(epoch)),
+    ).fetchone()
+    if dup is None:
+        _append_event(
+            conn, task_id, "adopted",
+            {
+                "reason": "restart_epoch_survivor",
+                "worker_pid": pid,
+                "claim_lock": claim_lock,
+                "epoch": int(epoch),
+                "rotated_at": int(rotated_at),
+                "claim_expires_now": new_expires,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
+
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -9298,6 +10314,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    t_e586ea59: ``board`` may be passed by multi-board dispatchers (the
+    gateway's embedded dispatcher ticks every board on disk in one
+    process). Worker-log reads for crash classification must resolve the
+    per-task log under THAT board's directory — ``get_current_board()``
+    inside a multi-board process resolves from env/file state that may
+    name a different board, silently returning ``None`` for the tail and
+    degrading every classifier below to the pre-tail era. The param is
+    optional; direct callers and tests keep the old behavior.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
@@ -9310,17 +10335,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     _restart_window = active_restart_window(conn)
     # Content-free crash errors ("pid N not alive") inside a window also
     # must not poison the systemic fingerprint counts.
+    # t_39ece1cd: restart orphans — neutral requeue, no failure tick.
+    restart_orphans: list[str] = []
+    # (task_id, pid, error_text, adopted_count) for the wake/event side.
+
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, exit_kind,
+    #  exit_code, started_at, run_id) — t_09c47c8d widened the tuple so the
+    # post-txn diagnostics pass can classify and comment without re-reading
+    # rows.
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    # t_39ece1cd: resolve the restart epoch BEFORE the reclaim txn. On the
+    # first pass of a new dispatcher process this performs the rotation
+    # (a small write) — outside write_txn it would race the txn below, so
+    # it lives here, and its own write is best-effort (see _write_meta).
+    _epoch, _epoch_rotated_at = _restart_epoch_state(conn)
+    _orphan_window = _resolve_restart_orphan_window_seconds()
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -9342,6 +10380,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if time.time() - started_at < grace:
                     continue
             if _pid_alive(row["worker_pid"]):
+                # t_39ece1cd wait-and-adopt: the worker is ALIVE — never
+                # crash-mark, never requeue beside it. Whether the claim is
+                # fresh (normal mid-flight run) or a cross-restart survivor
+                # (the 03:01 ghost-run incident: crash-marked claim whose
+                # worker kept executing), reclaiming here is wrong — it
+                # double-spawns onto a live worker. The stock grace/extension
+                # paths handle freshness; the epoch-qualified case gets an
+                # explicit ``adopted`` event so the board shows WHY this
+                # claim outlived its dispatcher.
+                _started = row["started_at"] if "started_at" in row.keys() else None
+                if (
+                    _epoch is not None
+                    and _started is not None
+                    and int(_started) < _epoch_rotated_at
+                    and int(time.time()) - _epoch_rotated_at <= _orphan_window
+                ):
+                    _adopt_one_live_claim(
+                        conn, row["id"], int(row["worker_pid"]),
+                        row["claim_lock"], epoch=_epoch,
+                        rotated_at=_epoch_rotated_at,
+                    )
                 continue
 
             pid = int(row["worker_pid"])
@@ -9389,6 +10448,67 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     rate_limited_exit = True
                     kind = "rate_limited"
                     code = KANBAN_RATE_LIMIT_EXIT_CODE
+            restart_orphan_exit = False
+            # t_e586ea59: board-aware tail reads. In a multi-board dispatch
+            # process (gateway embedded dispatcher), get_current_board() can
+            # resolve to a board other than the one `conn` belongs to; every
+            # worker-log read below then returns None and the classifiers
+            # degrade silently. Resolve the board ONCE per pass, preferring
+            # the explicit board param, and reuse it everywhere.
+            _board = board or get_current_board()
+            # t_ebde1f15: cross-process exit blindness + the -q rc=0 trap.
+            # (a) When this sweep runs in a process that did NOT spawn the
+            #     worker (one-shot cron dispatcher, WebUI bridge dispatch),
+            #     _classify_worker_exit returns ("unknown", None) — the exit
+            #     registry is per-process memory and waitpid only sees own
+            #     children. Reclassify from the worker's own log tail.
+            # (b) The plain ``-q`` single-query path (every non-goal worker)
+            #     swallows API failures — cli.py maps failure_reason to
+            #     exit codes only on the -Q path, so a worker that dies to a
+            #     fatal 429/quota wall exits rc=0 and lands in the
+            #     clean_exit lane below, which counts a protocol violation.
+            #     A tail that shows a fatal quota wall is a rate limit death
+            #     no matter what the exit code said — reroute it.
+            # Both reclassifications read the same tail once.
+            _blind_tail = ""
+            if kind in ("unknown", "clean_exit", "rate_limited"):
+                try:
+                    _blind_tail = read_worker_log(
+                        row["id"], tail_bytes=_CRASH_DIAG_TAIL_BYTES,
+                        board=_board,
+                    ) or ""
+                except Exception:
+                    _blind_tail = ""
+            if kind == "unknown":
+                _reclass = _reclassify_blind_exit(_blind_tail)
+                if _reclass == "rate_limited":
+                    kind = "rate_limited"
+                    code = None
+                # NOTE: a session-banner tail ("clean_exit" from
+                # _reclassify_blind_exit) deliberately does NOT map to the
+                # protocol-violation lane. The verdict_suspected annotation
+                # below reads the same banner and keeps the death in the
+                # crashed lane with survey-first retry doctrine —
+                # auto-blocking here would strand recoverable work
+                # (t_ebde1f15 regression vs t_09c47c8d semantics).
+                # "unknown" stays unknown — genuine abrupt death.
+            elif kind == "clean_exit" and _tail_shows_rate_limit(_blind_tail):
+                # Observed rc=0, but the worker actually died to a quota
+                # wall (the -q path never maps failures to exit codes).
+                # Quota semantics, not protocol-violation semantics.
+                kind = "rate_limited"
+                code = None
+            # t_e586ea59: honest provider-death cause. Whatever lane the
+            # exit kind landed in, the last attempt's tail may show WHY the
+            # provider refused service (quota / auth / unreachable). Extract
+            # the cause once and thread it into the error text, the event
+            # payload, and the run metadata, so the wake message a card
+            # creator receives leads with the CAUSE instead of the generic
+            # "protocol violation" / "pid not alive" blame.
+            _cause_tag, _cause_provider = _classify_provider_death(
+                _worker_attempt_tail(_blind_tail) if _blind_tail else ""
+            )
+
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -9397,9 +10517,27 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # a retry usually completes; the corrective sentence below is
                 # surfaced to the retry worker via the prior-attempt error in
                 # ``build_worker_context`` (guidance approach from #61817).
+                #
+                # t_e586ea59: when the tail shows the provider refused
+                # service (auth dead / endpoint unreachable — quota deaths
+                # were already rerouted above), LEAD with the cause: a
+                # clean-exit protocol violation caused by a dead provider is
+                # actionable (fix the credential / endpoint), while the bare
+                # violation text blames the worker and burns diagnostic
+                # cycles. Keep the protocol fact (no terminal call) after
+                # the cause.
+                _cause_prefix = ""
+                if _cause_tag:
+                    _who = f" ({_cause_provider})" if _cause_provider else ""
+                    _cause_prefix = (
+                        f"provider death: {_cause_tag}{_who} — the worker "
+                        f"could not reach its model API at exit. "
+                    )
                 protocol_violation = True
+                restart_orphan_exit = False
                 error_text = (
-                    "worker exited cleanly (rc=0) without calling "
+                    _cause_prefix
+                    + "worker exited cleanly (rc=0) without calling "
                     "kanban_complete or kanban_block — protocol violation. "
                     "If the prior run already did the work, verify it and "
                     "report the result via kanban_complete; a run that ends "
@@ -9416,6 +10554,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # the violation-only retry budget is derived later.
                     "protocol_violation": True,
                 }
+                if _cause_tag:
+                    event_payload["provider_cause"] = _cause_tag
+                    if _cause_provider:
+                        event_payload["provider"] = _cause_provider
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -9424,18 +10566,31 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # quota window clears, and crucially do NOT count a failure
                 # (skip ``_record_task_failure``) so a long quota window can't
                 # trip the circuit breaker and permanently block the card.
+                # t_e586ea59: name the provider and the cause in the error
+                # text and payload so the wake message a card creator
+                # receives says "provider-quota-exhausted (byteplus)" —
+                # the reassignment decision is then immediate instead of
+                # after a log-spelunking round. The cooldown guard's
+                # regexes (quota/429/rate-limit) still match this text.
+                _who = f" ({_cause_provider})" if _cause_provider else ""
+                _cause = _cause_tag or "provider-quota-exhausted"
                 protocol_violation = False
                 rate_limited_exit = True
+                restart_orphan_exit = False
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
+                    f"pid {pid} exited rate-limited — {_cause}{_who}: "
+                    f"provider quota/rate wall, requeued without counting "
+                    f"a failure (respawn deferred until the window clears)"
                 )
                 event_kind = "rate_limited"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    "provider_cause": _cause,
                 }
+                if _cause_provider:
+                    event_payload["provider"] = _cause_provider
                 if _sentinel is not None:
                     # Reclassified from a content-free death via the sidecar —
                     # record which throttle class the worker itself reported.
@@ -9447,22 +10602,122 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Already fully classified by the restart-window branch
                 # above (error_text / event_kind / event_payload set).
                 pass
+            elif (
+                kind == "unknown"
+                and _epoch is not None
+                and _orphan_window > 0
+                and started_at is not None
+                and int(started_at) < _epoch_rotated_at
+                and int(time.time()) - _epoch_rotated_at <= _orphan_window
+            ):
+                # t_39ece1cd neutral lane: restart orphan. The claim was
+                # taken under a PRIOR epoch (started before the rotation),
+                # the worker's PID died with the container/restart window,
+                # and this process's exit registry has no record of it
+                # (kind == "unknown") — the signature of the 03:45
+                # incident, where a Captain-timed restart produced
+                # "crashed=2 auto_blocked=2" out of perfectly healthy
+                # work. NEUTRAL semantics, exactly like rate_limited:
+                # no _record_task_failure, no auto-block, no breaker
+                # pressure — an honest event + requeue. Workers that
+                # genuinely crashed mid-flight right after a restart
+                # (started under the NEW epoch, or beyond the window)
+                # keep the stock crashed classification.
+                protocol_violation = False
+                rate_limited_exit = False
+                restart_orphan_exit = True
+                error_text = (
+                    f"pid {pid} not alive — container restart orphaned the "
+                    f"worker (epoch rotation {int(_epoch_rotated_at)}); "
+                    f"requeued without counting a failure"
+                )
+                event_kind = "restart_orphan"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "epoch": int(_epoch),
+                    "rotated_at": int(_epoch_rotated_at),
+                }
+                if _cause_tag:
+                    event_payload["provider_cause"] = _cause_tag
+                    if _cause_provider:
+                        event_payload["provider"] = _cause_provider
             else:
                 protocol_violation = False
+                restart_orphan_exit = False
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
                     error_text = f"pid {pid} not alive"
+                # t_e586ea59: a dead-PID death whose tail names a provider
+                # cause (quota storms that killed the process, auth walls,
+                # unreachable endpoints) should say so — the incident class
+                # (t_86a04f09 runs 3119/3120) produced bare "pid not alive"
+                # rows whose logs were full of BytePlus 429 banners. Quota
+                # causes stay in the crashed lane here only when the reroute
+                # above couldn't apply (e.g. no session banner / mixed
+                # markers); either way the CAUSE leads the text.
+                if _cause_tag:
+                    _who = f" ({_cause_provider})" if _cause_provider else ""
+                    error_text = (
+                        f"{_cause_tag}{_who} — {error_text} "
+                        f"(provider refused service before death; see the "
+                        f"crash-diagnostics comment)"
+                    )
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                # t_e586ea59: cause fields attach AFTER the payload dict is
+                # built (v3 e2e caught the fuzzy-apply having written them
+                # before initialization — UnboundLocalError on every
+                # dead-PID death with a provider-cause tail).
+                if _cause_tag:
+                    event_payload["provider_cause"] = _cause_tag
+                    if _cause_provider:
+                        event_payload["provider"] = _cause_provider
+                # t_09c47c8d (#42289 pattern): distinguish "died mid-work"
+                # from "died AFTER producing final output". A dead PID whose
+                # worker-log tail carries finished-output markers on a run
+                # that lived a while is the classic lost-verdict death — the
+                # work exists, only the kanban_complete never fired.
+                try:
+                    _vtail = read_worker_log(
+                        row["id"], tail_bytes=_CRASH_DIAG_TAIL_BYTES,
+                        board=_board,
+                    ) or ""
+                except Exception:
+                    _vtail = ""
+                _ran = None
+                try:
+                    _ran = int(time.time()) - int(row["started_at"] or 0)
+                except (TypeError, ValueError):
+                    _ran = None
+                if (
+                    _vtail
+                    and (_ran is None or _ran >= _VERDICT_MIN_RUN_SECONDS)
+                    and any(m.search(_vtail) for m in _VERDICT_TAIL_MARKERS)
+                ):
+                    event_payload["verdict_suspected"] = True
+                    error_text = (
+                        error_text
+                        + " [worker log tail looks like finished output — "
+                        "likely died after producing its result and before "
+                        "kanban_complete; see the crash-diagnostics comment]"
+                    )
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            # t_e586ea59: snapshot the final classified reason into every
+            # death payload (rate_limited / protocol_violation / crashed)
+            # so wake consumers (gateway watcher, WebUI kanban-notifier)
+            # can surface an honest one-line cause without re-reading the
+            # worker log. Previously only the crashed lane had pid/claimer
+            # and every wake said "(pid gone)" or nothing at all.
+            event_payload["error"] = error_text[:400]
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
@@ -9471,16 +10726,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
-                # Rate-limited / restart-killed requeues are a clean release,
-                # not a crash — record the run outcome so the board history
-                # doesn't show a phantom crash for a quota wall or a declared
-                # container restart.
+                # Rate-limited / restart-killed / restart-orphan requeues
+                # are a clean release, not a crash — record the run outcome
+                # so the board history doesn't show a phantom crash for a
+                # quota wall or a container restart (declared window or
+                # dispatcher-epoch orphan).
                 if rate_limited_exit:
                     _run_outcome = "rate_limited"
                 elif kind == "restart_killed":
                     _run_outcome = "restart_killed"
+                elif restart_orphan_exit:
+                    _run_outcome = "restart_orphan"
                 else:
                     _run_outcome = "crashed"
+
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -9501,6 +10760,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_code": code,
                     "outcome": _run_outcome,
                     "retry_status": retry_status,
+                    # t_e586ea59: let lifecycle observers (WebUI bridge
+                    # monitor, event monitor scripts) see the honest cause.
+                    "provider_cause": _cause_tag or "",
+                    "provider": _cause_provider or "",
                 })
                 if rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
@@ -9518,6 +10781,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # rate_limited, but respawn is NOT deferred (the restart
                     # window itself holds spawns until it closes).
                     restart_killed.append(row["id"])
+                elif restart_orphan_exit:
+                    # t_39ece1cd: neutral requeue. No failure stamp — the
+                    # restart killed the run, not the work; stamping
+                    # last_failure_error would feed the respawn-guard
+                    # regexes and the board UI a "failure" that never
+                    # happened. The task is already back at ``ready`` (or
+                    # its retry_status); the next tick respawns it.
+                    # Deliberately NO cooldown: the provider is fine, the
+                    # box just rebooted.
+                    restart_orphans.append(row["id"])
+
                 else:
                     if protocol_violation:
                         # Stamp the failure error now: a below-budget
@@ -9534,7 +10808,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, kind, code,
+                         row["started_at"], run_id)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -9556,10 +10831,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
-            fp = _error_fingerprint(err_text)
+        for cd in crash_details:
+            fp = _error_fingerprint(cd[4])
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (tid, pid, claimer, protocol_violation, error_text,
+             exit_kind, exit_code, started_at, run_id) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -9634,6 +10910,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             )
             if tripped:
                 auto_blocked.append(tid)
+    # t_09c47c8d (#54154 pattern): best-effort crash-diagnostics comment.
+    # Runs AFTER every reclaim/accounting txn above has committed, never
+    # raises, one comment per task per pass, and is skipped entirely for
+    # rate-limited requeues (they never enter crash_details).
+    if crash_details and _crash_diagnostics_enabled():
+        _diag_done: set = set()
+        for (tid, pid, claimer, protocol_violation, error_text,
+             exit_kind, exit_code, started_at, run_id) in crash_details:
+            if tid in _diag_done:
+                continue
+            _diag_done.add(tid)
+            try:
+                _post_crash_diagnostics_comment(
+                    conn,
+                    task_id=tid, pid=pid, exit_kind=exit_kind,
+                    exit_code=exit_code, error_text=error_text,
+                    started_at=started_at, run_id=run_id,
+                    board=board,
+                )
+            except Exception:
+                _log.exception(
+                    "kanban dispatcher: crash-diagnostics comment "
+                    "failed for %s", tid,
+                )
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
@@ -9647,6 +10947,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Opportunistic hygiene: drop sentinel sidecars old enough that no run
     # they could speak for is still open.
     _sweep_stale_rate_limit_sentinels()
+    # t_39ece1cd: and the same for restart orphans (neutral requeue, no
+    # failure counted). dispatch_once surfaces these in DispatchResult.
+    detect_crashed_workers._last_restart_orphans = restart_orphans  # type: ignore[attr-defined]
+
     # Worker-lifecycle observer (RFC #58548): exit events are tick-derived
     # from this reclaim pass — fired only now, after the main reclaim txn
     # AND the breaker accounting above have committed, so subscribers always
@@ -9662,6 +10966,135 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 **hook_fields,
             )
     return crashed
+
+
+def _post_crash_diagnostics_comment(
+    conn: sqlite3.Connection, *, task_id: str, pid: int,
+    exit_kind: str, exit_code: Optional[int], error_text: str,
+    started_at: Optional[int], run_id: Optional[int],
+    board: Optional[str] = None,
+) -> None:
+    """Attach death-time diagnostics to a crashed task (#54154 pattern).
+
+    Best-effort and never raises: every capture step is individually
+    guarded, and a failure in one section posts "(unavailable)" for that
+    section rather than aborting the comment. Sections are size-capped so
+    the comment stays readable in the board UI and in
+    ``build_worker_context`` (which truncates long comments anyway).
+
+    The goal (with the ``verdict_suspected`` classification in
+    ``detect_crashed_workers``) is that a worker that died holding a real,
+    unpersisted verdict — our run-3079 incident class, upstream #42289 —
+    leaves the retry worker enough evidence to VERIFY-AND-COMPLETE instead
+    of redoing an hour of work blind.
+    """
+    def _sec(lines: list[str]) -> str:
+        return "\n".join(lines)[:_CRASH_DIAG_TAIL_CHARS] or "(empty)"
+
+    # Worker-log tail — the per-task log under <board>/logs/.
+    try:
+        tail = read_worker_log(
+            task_id, tail_bytes=_CRASH_DIAG_TAIL_BYTES,
+            board=board or get_current_board(),
+        ) or ""
+    except Exception:
+        tail = ""
+    tail_clean = _ANSI_RE.sub("", tail).rstrip()
+    # Keep the LAST lines: the death happened at the end.
+    tail_lines = tail_clean.splitlines()[-40:]
+    tail_sec = _sec(tail_lines)
+
+    # Kernel log snippet — OOM kills / segfaults mention the pid.
+    dmesg_sec = "(unavailable)"
+    try:
+        proc = subprocess.run(
+            list(_DMESG_CMD), capture_output=True, text=True, timeout=3,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            hits = [
+                ln.rstrip() for ln in proc.stdout.splitlines()
+                if _DMESG_GREP_RE.search(ln)
+                or (pid is not None and re.search(rf"\b{pid}\b", ln))
+            ]
+            dmesg_sec = "\n".join(hits[-12:])[:_CRASH_DIAG_DMESG_CHARS] \
+                or "(no OOM/segfault lines for this pid)"
+    except Exception:
+        pass
+
+    # Session id — the CLI prints "Session: <id>" when a run finishes.
+    session_id = None
+    m = _SESSION_ID_RE.findall(tail_clean)
+    if m:
+        session_id = m[-1]
+
+    dur = None
+    try:
+        if started_at:
+            dur = int(time.time()) - int(started_at)
+    except (TypeError, ValueError):
+        dur = None
+
+    try:
+        log_path = worker_log_path(task_id, board=board or get_current_board())
+    except Exception:
+        log_path = None
+
+    head = [
+        "🔧 Worker crash diagnostics (t_09c47c8d · #54154/#42289 pattern)",
+        f"run {run_id} · pid {pid} · exit_kind={exit_kind}"
+        + (f" exit_code={exit_code}" if exit_code is not None else "")
+        + (f" · ran {dur}s" if dur is not None else ""),
+        f"error: {error_text}",
+    ]
+    if log_path is not None:
+        head.append(f"worker log: {log_path}")
+    if session_id:
+        head.append(
+            f"last session id seen in log tail: {session_id} "
+            "(may be from an earlier run — verify before resuming)"
+        )
+    hint = "Diagnosis hint: undetermined — inspect the tail below."
+    if "provider-quota-exhausted" in error_text or "provider-auth-failed" in error_text \
+            or "provider-unreachable" in error_text:
+        # t_e586ea59: the death was a provider refusal (quota/auth/unreach).
+        # Extract the tag back out of the leading error text for the hint.
+        _tag = next(
+            (t for t in (
+                "provider-quota-exhausted", "provider-auth-failed",
+                "provider-unreachable",
+            ) if t in error_text),
+            "",
+        )
+        hint = (
+            f"Diagnosis hint: {_tag} — the provider refused service "
+            f"(quota/plan/credential/endpoint), NOT a task or worker "
+            f"failure. Check the provider account (quota window, plan, "
+            f"key) or reassign the card to a different provider/profile "
+            f"before retrying."
+        )
+    elif "verdict_suspected" in error_text or "finished output" in error_text:
+        hint = (
+            "Diagnosis hint: the log tail looks like FINISHED output — the "
+            "worker likely died after producing its result and before "
+            "kanban_complete. The retry worker should CHECK what already "
+            "exists (board, trees, files) and complete the card rather "
+            "than redo the work blind."
+        )
+    elif exit_kind == "signaled" and exit_code in (9, 15):
+        hint = (
+            f"Diagnosis hint: killed by signal {exit_code} — consistent "
+            "with an OOM-kill or external reaper; check the dmesg section."
+        )
+
+    body = (
+        "\n".join(head)
+        + "\n\n-- last ≤40 lines of worker output (ANSI-stripped) --\n"
+        + tail_sec
+        + "\n\n-- kernel log (dmesg, OOM/segfault/pid grep) --\n"
+        + dmesg_sec
+        + "\n\n" + hint
+    )
+    add_comment(conn, task_id, "dispatcher", body)
 
 
 def _record_task_failure(
@@ -10493,10 +11926,46 @@ def _dispatch_once_locked(
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+        # Terminal-event reconciliation (t_5e71675d): synthesize the
+        # `completed` event for done tasks closed by a writer that bypassed
+        # complete_task (hand-rolled SQL, crashed kernel path, etc). Without
+        # the event row, every notifier (gateway wake + WebUI plugin) stays
+        # silent and mission chains stall. Rides the same flag because both
+        # reconcilers are passive repair passes over existing state.
+        try:
+            reconcile_missing_terminal_events(conn)
+        except Exception:
+            _log.exception("kanban dispatcher: terminal-event reconciler failed")
+        # Unreachable-assignee sweep (t_09c47c8d): flag cards parked in
+        # ready/review/todo/triage under an assignee that names no Hermes
+        # profile. The spawn loops correctly skip them (terminal lanes),
+        # but a hallucinated/typo'd assignee is silently terminal without
+        # this pass — no run, no wake, no error. Emits
+        # ``assignee_unreachable`` (notifier-terminal on both wake paths)
+        # + a board comment; never mutates assignment. Same passive-repair
+        # posture as the two reconcilers above.
+        try:
+            result.flagged_unreachable = reconcile_stuck_assignees(conn)
+        except Exception:
+            _log.exception("kanban dispatcher: unreachable-assignee sweep failed")
+        # Review-spawn starvation detector (t_f0393d9f): the OTHER half of
+        # the frozen-review gap — a review card under a REAL profile that
+        # never spawns (per-profile cap, crash loop, review-lane wedge)
+        # produces zero events and is invisible in the WebUI. Emits
+        # ``review_spawn_starved`` (notifier-terminal on both wake paths)
+        # + a board comment; idempotent per episode; never mutates
+        # assignment. Same passive-repair posture as the sweep above.
+        try:
+            result.review_spawn_starved = detect_review_spawn_starved(conn)
+        except Exception:
+            _log.exception("kanban dispatcher: review-spawn-starved detector failed")
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    # t_e586ea59: pass the explicit board so worker-log tail reads inside
+    # crash classification resolve under THIS board even when the process
+    # ticks several boards (gateway embedded dispatcher).
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -10529,6 +11998,15 @@ def _dispatch_once_locked(
         result.restart_window_hold = True
         result.promoted = recompute_ready(conn, failure_limit=failure_limit)
         return result
+    # t_39ece1cd: restart-orphan requeues (dispatcher/container restart,
+    # no failure counted) — surface for telemetry / tests like the other
+    # neutral lanes.
+    _crash_restart_orphans = getattr(
+        detect_crashed_workers, "_last_restart_orphans", []
+    )
+    if _crash_restart_orphans:
+        result.restart_orphans.extend(_crash_restart_orphans)
+
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
