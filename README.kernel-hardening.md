@@ -8,11 +8,12 @@ build source for the `hermes-webui` container image (Coolify stack
 **Base tracking:** the `KERNEL_BASE` file at repo root records the upstream
 tag (`NousResearch/hermes-agent`) this branch is currently based on.
 
-## What lives here (9 files + 5 tests — the only files we carry)
+## What lives here (10 files + 6 tests — the only files we carry)
 
 | File | Hardening |
 |---|---|
-| `hermes_cli/kanban_db.py` | blob-500 TEXT-coercion fix (bundle `997eb31b`) + rate-limit sentinel sidecar state + review-lane reliability stack (t_4ce2d942 union): unreachable-assignee sweep w/ review-lane 15-min grace, `review_spawn_starved` detector, restart-orphan neutral lane + epoch adopt, provider-cause death classification, blind-exit/qpath reclass |
+| `hermes_cli/kanban_db.py` | blob-500 TEXT-coercion fix (bundle `997eb31b`) + rate-limit sentinel sidecar state + review-lane reliability stack (t_4ce2d942 union): unreachable-assignee sweep w/ review-lane 15-min grace, `review_spawn_starved` detector, restart-orphan neutral lane + epoch adopt, provider-cause death classification, blind-exit/qpath reclass + write-time assignee/reviewer validation (t_fbd0fb38): phantom names rejected at the tool call, 3-strike per-card counter with auto-fallback to `reviewer=None`, `HERMES_KANBAN_ASSIGNEE_VALIDATION` / `kanban.assignee_validation` kill-switch |
+| `tools/kanban_tools.py` | t_fbd0fb38: `_validate_write_assignee` gate on `kanban_request_review` (card untouched on reject; fallback comment on 3rd strike) and stateless phantom rejection on `kanban_create` |
 | `hermes_cli/kanban.py` | kanban restart-window guard (`_cmd_restart_window`) |
 | `cli.py` | `_kanban_transient_failure_reason` classification |
 | `agent/retry_utils.py` | transient-throttle retry budget 3→8, adaptive 15/30/60/60s backoff |
@@ -22,6 +23,7 @@ tag (`NousResearch/hermes-agent`) this branch is currently based on.
 | `tests/hermes_cli/test_kanban_review_wake_gaps.py` | 13-check review-wake suite |
 | `tests/hermes_cli/test_kanban_restart_orphan.py` | restart-orphan suite |
 | `tests/hermes_cli/test_kanban_blind_exit_reclass.py` + `test_kanban_qpath_quota_trap.py` | blind-exit / -q rc=0 quota suites |
+| `tests/hermes_cli/test_kanban_assignee_validation.py` | t_fbd0fb38: 19-check write-validation suite (reject/untouched, 3-strike fallback, counter reset, kill-switch, fail-open, create path, no-wake guarantee) |
 
 The runtime boot hook `/workspace/kernel-restore/boot-entry.sh` (compose
 `command:`) stays in place as an **idempotent tripwire**: on a pre-patched
