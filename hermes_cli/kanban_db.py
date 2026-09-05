@@ -5334,6 +5334,272 @@ def _resolve_unreachable_grace_seconds(
     return lane_default
 
 
+
+
+# ---------------------------------------------------------------------------
+# Write-time assignee/reviewer validation (t_fbd0fb38)
+#
+# Phantom names (a hallucinated reviewer on ``request_review``, a typo'd
+# assignee on ``create``) used to enter the board silently: the review card
+# parked under an assignee that names no profile and only the unreachable-
+# sweep guards (t_09c47c8d/t_f0393d9f) broke the silence, minutes-to-hours
+# later, at the cost of a wake. The dispatcher also SILENTLY DROPS unknown-
+# assignee cards (they sit in ``ready`` forever — the documented worker-
+# protocol trap). These helpers power rejection AT THE TOOL CALL instead:
+# nonexistent NONEMPTY names never reach the board.
+#
+# Loop safety is the Captain's 3-strike rule: a per-task durable counter
+# (task_events kind ``assignee_invalid_attempt``) bounds the retries. On the
+# third invalid attempt on the same card the gate stops rejecting and auto-
+# falls back to ``reviewer=None`` routing (self/FO review) with a visible
+# board comment, so validation can never wedge a card. The counter resets on
+# any successful validated request_review. Note the counter/fallback event
+# kinds are deliberately NOT in any notifier terminal set — counting an
+# invalid attempt must not itself wake anyone.
+# ---------------------------------------------------------------------------
+
+# Names are resolved through the same defensive gate the dispatcher uses.
+# ``HERMES_KANBAN_ASSIGNEE_VALIDATION`` env (any of 0/false/no/off, case-
+# insensitive) disables write-time validation for tests/exotic deployments;
+# ``kanban.assignee_validation: false`` in config.yaml mirrors it. Default ON.
+ENV_ASSIGNEE_VALIDATION = "HERMES_KANBAN_ASSIGNEE_VALIDATION"
+
+# Third invalid attempt on the same card auto-falls back instead of rejecting.
+INVALID_ASSIGNEE_ATTEMPT_LIMIT = 3
+
+# task_events kind written each time a write surface rejects a phantom name.
+EVENT_KIND_INVALID_ATTEMPT = "assignee_invalid_attempt"
+# task_events kind written when the 3-strike fallback fires (proceeds with
+# reviewer=None). Also the reset marker: any successful validated
+# request_review writes it, clearing the counter.
+EVENT_KIND_VALIDATED = "assignee_write_validated"
+
+
+def assignee_validation_enabled() -> bool:
+    """Whether write-time assignee/reviewer validation is active (default ON).
+
+    Resolution order: ``HERMES_KANBAN_ASSIGNEE_VALIDATION`` env (off-switch),
+    then ``kanban.assignee_validation`` in config.yaml, then ON. Only an
+    explicit falsey value disables — parse errors fall back to ON so a typo'd
+    knob can never silently open the phantom-name gate.
+    """
+    raw = os.environ.get(ENV_ASSIGNEE_VALIDATION, "").strip()
+    if raw:
+        return raw.lower() not in ("0", "false", "no", "off")
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = (load_config() or {}).get("kanban", {}) or {}
+        val = cfg.get("assignee_validation")
+        if val is None:
+            return True
+        if isinstance(val, str):
+            return val.strip().lower() not in ("0", "false", "no", "off")
+        return bool(val)
+    except Exception:
+        return True
+
+
+# Short-TTL cache for profile existence (the card notes profile_exists may be
+# a filesystem stat per call; a worker retrying a name shouldn't pay it twice
+# within one conversation turn, and error hints shouldn't stat the world).
+_PROFILE_EXISTS_CACHE_TTL_SECONDS = 30.0
+_profile_exists_cache: dict = {}
+_profile_exists_cache_lock = threading.Lock()
+
+
+def _cached_profile_exists(name: str) -> Optional[bool]:
+    """TTL-cached wrapper over :func:`_dispatch_profile_exists`.
+
+    Keyed on (canonical name, profiles root) so a test that repoints
+    HERMES_HOME can't be served a stale hit from another root. Returns the
+    same ``None``-means-unknown contract.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    try:
+        root = str(get_default_hermes_root())
+    except Exception:
+        root = "?"
+    key = (root, str(name))
+    now = time.monotonic()
+    with _profile_exists_cache_lock:
+        hit = _profile_exists_cache.get(key)
+        if hit is not None and now - hit[1] < _PROFILE_EXISTS_CACHE_TTL_SECONDS:
+            return hit[0]
+    resolved = _dispatch_profile_exists(str(name))
+    with _profile_exists_cache_lock:
+        _profile_exists_cache[key] = (resolved, now)
+        # opportunistic trim: keep the cache tiny (names per board are few)
+        if len(_profile_exists_cache) > 128:
+            cutoff = now - _PROFILE_EXISTS_CACHE_TTL_SECONDS
+            for k in [
+                k for k, v in _profile_exists_cache.items() if v[1] < cutoff
+            ]:
+                _profile_exists_cache.pop(k, None)
+    return resolved
+
+
+def resolve_write_profile(name: Optional[str]) -> tuple[str, Optional[bool]]:
+    """Normalize + resolve an assignee/reviewer name for write validation.
+
+    Returns ``(normalized, exists)`` where ``exists`` mirrors the
+    :func:`_dispatch_profile_exists` contract: ``True``/``False`` for a
+    resolved answer, ``None`` when the profiles module can't answer (tests,
+    exotic envs) — the caller MUST treat ``None`` as pass-through, never
+    reject (fail-open, same doctrine as the dispatcher's spawn gate).
+
+    A leading ``@`` is tolerated and stripped (agents routinely write
+    ``@profile`` after seeing the UI's mention syntax); empty/whitespace
+    strings normalize to ``""`` and are the caller's signal to skip
+    validation entirely (``reviewer=None`` stays legal).
+    """
+    if name is None:
+        return "", None
+    cleaned = str(name).strip()
+    while cleaned.startswith("@"):
+        cleaned = cleaned[1:].strip()
+    if not cleaned:
+        return "", None
+    try:
+        normalized = _canonical_assignee(cleaned)
+    except Exception:
+        normalized = cleaned.lower()
+    return normalized or "", _cached_profile_exists(normalized)
+
+
+def valid_assignee_hint() -> str:
+    """One-line, Captain-readable hint listing real profile names.
+
+    Capped at ~12 names so the error never becomes a wall; ``...`` marks
+    truncation. Falls back to naming ``hermes profile list`` when the
+    profile set can't be enumerated (never raises).
+    """
+    names: list = []
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        names = [p.name for p in list_profiles() if getattr(p, "name", None)]
+    except Exception:
+        names = []
+    if not names:
+        return "run `hermes profile list` to see the valid profile names"
+    shown = ", ".join(sorted(names)[:12])
+    if len(names) > 12:
+        shown += ", ..."
+    return f"valid profiles: {shown}"
+
+
+def count_invalid_assignee_attempts(conn: sqlite3.Connection, task_id: str) -> int:
+    """How many phantom-name rejections this card has already recorded.
+
+    Counts ``assignee_invalid_attempt`` events AFTER the latest
+    ``assignee_write_validated`` marker, so a success resets the strike
+    counter to zero without rewriting history (durable, append-only audit).
+    Ordering is by monotonic event id, NOT ``created_at`` (second
+    granularity would collapse a fallback-and-retry sequence written within
+    one second — observed in the t_fbd0fb38 test suite).
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM task_events e
+         WHERE e.task_id = ? AND e.kind = ?
+           AND e.id > COALESCE(
+               (SELECT MAX(v.id) FROM task_events v
+                 WHERE v.task_id = ? AND v.kind = ?), 0
+           )
+        """,
+        (task_id, EVENT_KIND_INVALID_ATTEMPT, task_id, EVENT_KIND_VALIDATED),
+    ).fetchone()
+    return int(row["n"]) if row is not None else 0
+
+
+def record_invalid_assignee_attempt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    field: str,
+    name: str,
+) -> int:
+    """Append one ``assignee_invalid_attempt`` event; return the new count.
+
+    MUST be called inside an open write txn (the caller owns the txn so the
+    rejection itself stays atomic with nothing — the card is untouched — but
+    the counter must survive the failed call durably).
+    """
+    _append_event(
+        conn,
+        task_id,
+        EVENT_KIND_INVALID_ATTEMPT,
+        {"field": field, "name": str(name)[:200]},
+        run_id=None,
+    )
+    return count_invalid_assignee_attempts(conn, task_id)
+
+
+def record_assignee_write_validated(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    field: str,
+    name: Optional[str],
+) -> None:
+    """Write the reset marker — one validated write clears the strikes.
+
+    Called AFTER a successful ``request_review`` whose reviewer passed
+    validation (explicit or provenance-resolved), so a card that learned the
+    right name isn't one typo away from forced fallback on its next review
+    cycle.
+    """
+    _append_event(
+        conn,
+        task_id,
+        EVENT_KIND_VALIDATED,
+        {"field": field, "name": (str(name)[:200] if name else None)},
+        run_id=None,
+    )
+
+
+def record_assignee_validation_fallback(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    field: str,
+    name: str,
+    attempts: int,
+) -> None:
+    """3-strike forced fallback: visible board comment + audit event.
+
+    Plain English by Captain's requirement — an operator reading the card
+    must understand what happened without knowing the kernel. The comment
+    and event are NOT terminal kinds: no wake fires for this (the whole
+    point of t_fbd0fb38 is removing wake noise; the existing unreachable/
+    starve guards still cover the fallback path's dispatch health).
+    """
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            task_id,
+            "dispatcher",
+            (
+                f"ℹ️ Reviewer routing fallback: '{name}' is not a real Hermes "
+                f"profile (rejected {attempts} times), so this card now uses "
+                f"the standard review routing instead. Worker note: use a "
+                f"real profile name next time — {valid_assignee_hint()}."
+            ),
+            int(time.time()),
+        ),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "assignee_validation_fallback",
+        {"field": field, "name": str(name)[:200], "attempts": int(attempts)},
+        run_id=None,
+    )
+
+
 def _dispatch_profile_exists(name: str) -> Optional[bool]:
     """Resolve ``hermes_cli.profiles.profile_exists`` defensively.
 

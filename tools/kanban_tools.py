@@ -180,6 +180,62 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+def _validate_write_assignee(
+    kb, conn, task_id: str, field: str, name: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Write-time phantom-name gate (t_fbd0fb38).
+
+    Returns ``(error, fallback_note)`` — BOTH None means proceed unchanged.
+    ``error`` is a tool-error string the calling agent reads and retries
+    with a correct name (the card is left untouched — no park, no wake).
+    ``fallback_note`` is set when the 3-strike rule fires: proceed, but with
+    the phantom name dropped (caller must use assignee/reviewer=None); the
+    fallback comment + audit event are written here, inside the caller's
+    connection.
+
+    Contract mirrors the kernel helper: empty/None names pass (reviewer=None
+    stays the legal self/FO-review path); an unresolvable profiles module
+    fails OPEN (None from profile_exists must never reject a real profile).
+    """
+    if not kb.assignee_validation_enabled():
+        return None, None
+    normalized, exists = kb.resolve_write_profile(name)
+    if not normalized or exists is not False:
+        # Empty (skip) or resolved-real / unresolvable (fail-open).
+        return None, None
+    strikes = kb.count_invalid_assignee_attempts(conn, task_id)
+    if strikes + 1 < kb.INVALID_ASSIGNEE_ATTEMPT_LIMIT:
+        with kb.write_txn(conn):
+            attempts = kb.record_invalid_assignee_attempt(
+                conn, task_id, field=field, name=normalized
+            )
+        return (
+            tool_error(
+                f"{normalized!r} is not a real Hermes profile — the card was "
+                f"NOT changed. Pick a real profile name ({kb.valid_assignee_hint()}) "
+                f"or omit {field} to use the standard review routing. "
+                f"(attempt {attempts} of {kb.INVALID_ASSIGNEE_ATTEMPT_LIMIT}; "
+                f"after that the card falls back to standard routing "
+                f"automatically)"
+            ),
+            None,
+        )
+    # 3rd strike: stop rejecting, fall back, make it visible.
+    with kb.write_txn(conn):
+        kb.record_invalid_assignee_attempt(
+            conn, task_id, field=field, name=normalized
+        )
+        kb.record_assignee_validation_fallback(
+            conn, task_id, field=field, name=normalized, attempts=strikes + 1
+        )
+    return (
+        None,
+        f"reviewer {normalized!r} is not a real profile (3rd invalid attempt) "
+        f"— fell back to standard review routing; a comment was posted on "
+        f"the card",
+    )
+
+
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -936,6 +992,24 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # Write-time phantom-reviewer gate (t_fbd0fb38): reject BEFORE
+            # any state changes so a hallucinated name can never park the
+            # card in review under an unspawnable assignee. 3-strike rule:
+            # the third invalid name auto-falls back to reviewer=None
+            # routing (self/FO review) with a visible card comment, so
+            # validation can never wedge the card.
+            validation_error, fallback_note = _validate_write_assignee(
+                kb, conn, tid, "reviewer", reviewer
+            )
+            if validation_error is not None:
+                return validation_error
+            if fallback_note is not None:
+                reviewer = None
+            elif reviewer:
+                # Validated name — pass the NORMALIZED form (leading "@"
+                # stripped, lowercased) so the stored assignee matches the
+                # profile the dispatcher will spawn.
+                reviewer = kb.resolve_write_profile(reviewer)[0] or reviewer
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
@@ -957,13 +1031,24 @@ def _handle_request_review(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not request review for {tid}: {detail}"
                 )
+            # Success (validated explicit reviewer, fallback, or omitted):
+            # durable reset marker — one good write clears the strike
+            # counter so a card that learned the right name isn't one typo
+            # from forced fallback on its next review cycle.
+            with kb.write_txn(conn):
+                kb.record_assignee_write_validated(
+                    conn, tid, field="reviewer", name=reviewer
+                )
             run = kb.latest_run(conn, tid)
             landed = kb.get_task(conn, tid)
-            return _ok(
-                task_id=tid,
-                run_id=run.id if run else None,
-                status=landed.status if landed else "review",
-            )
+            result = {
+                "task_id": tid,
+                "run_id": run.id if run else None,
+                "status": landed.status if landed else "review",
+            }
+            if fallback_note is not None:
+                result["reviewer_fallback"] = fallback_note
+            return _ok(**result)
         finally:
             conn.close()
     except ValueError as e:
@@ -1358,6 +1443,23 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Write-time phantom-assignee gate (t_fbd0fb38): the dispatcher
+    # SILENTLY DROPS cards whose assignee names no profile (they sit in
+    # ready forever). Reject at the call instead — the card is never
+    # created, the agent reads the error and retries with a real name.
+    # Stateless by design: the task row doesn't exist yet, so there is no
+    # per-card counter and no fallback target (a None assignee is exactly
+    # the silent-drop trap this gate exists to prevent).
+    if str(assignee).strip():
+        from hermes_cli import kanban_db as _kb_validate
+        if _kb_validate.assignee_validation_enabled():
+            _norm, _exists = _kb_validate.resolve_write_profile(assignee)
+            if _norm and _exists is False:
+                return tool_error(
+                    f"{_norm!r} is not a real Hermes profile — the task was "
+                    f"NOT created. Pick a real profile name "
+                    f"({_kb_validate.valid_assignee_hint()})."
+                )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")

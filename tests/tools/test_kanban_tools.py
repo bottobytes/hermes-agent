@@ -56,6 +56,13 @@ def worker_env(monkeypatch, tmp_path):
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
+    # t_fbd0fb38: write-time assignee validation is ON by default; the
+    # synthetic assignees below ("test-worker", "peer") name no real profile
+    # under the tmp home. Same house pattern as ``all_assignees_spawnable``
+    # in tests/hermes_cli/conftest.py.
+    import hermes_cli.profiles as _profiles
+    monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
+
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()

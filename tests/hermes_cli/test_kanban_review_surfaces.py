@@ -19,6 +19,11 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_PROFILE", "builder")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    # t_fbd0fb38: write-time assignee validation is ON by default; the
+    # synthetic reviewers below ("reviewer", "builder") name no real profile
+    # under the tmp home (house pattern: all_assignees_spawnable).
+    import hermes_cli.profiles as _profiles
+    monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kb.connect() as conn:
