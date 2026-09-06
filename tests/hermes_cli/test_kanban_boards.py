@@ -175,6 +175,100 @@ class TestBoardCRUD:
         assert "task_events" in tables
         assert "tasks" in tables
 
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_removed_board_with_cached_path_refuses_reinit(
+        self, fresh_home, archive, caplog
+    ):
+        # Regression for the ghost-board resurrection bug (t_bbdec489 /
+        # 2026-09-06): a long-lived process (the gateway) that had the
+        # board in its _INITIALIZED_PATHS cache kept re-creating an empty
+        # board dir + schema-complete DB at the removed path whenever a
+        # poll tick raced the removal (enumerate → TOCTOU → connect).
+        # connect() must now refuse to resurrect a schema for a slug that
+        # no longer has persisted metadata on disk.
+        kb.create_board("ghost")
+        # Populate this process's init cache, as the long-lived gateway
+        # would have from a day of dispatching the board.
+        with kb.connect(board="ghost"):
+            pass
+        db_path = kb.board_dir("ghost") / "kanban.db"
+        assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+
+        # remove_board drops the CLI process's own cache entry, but the
+        # gateway's cache still holds the path — simulate that stale
+        # long-lived-process cache by re-adding it after removal. With
+        # archive=False the rm flow deliberately leaves the tombstone
+        # board.json behind (invisible board, no DB), so assert the DB
+        # is what's gone rather than the whole directory.
+        kb.remove_board("ghost", archive=archive)
+        assert not (kb.board_dir("ghost") / "kanban.db").exists()
+        kb._INITIALIZED_PATHS.add(str(db_path.resolve()))
+        kb._REMOVED_BOARD_SLUGS.add("ghost")
+
+        # A stale cached process reconnecting to the removed slug must
+        # not recreate the directory or the DB.
+        with pytest.raises(kb.BoardRemovedError):
+            with kb.connect(board="ghost"):
+                pass
+        # Same refusal through init_db() — it must not mkdir either.
+        with pytest.raises(kb.BoardRemovedError):
+            kb.init_db(board="ghost")
+        if archive:
+            assert not kb.board_dir("ghost").exists()
+        else:
+            # Hard delete leaves only the invisible tombstone board.json.
+            assert not (kb.board_dir("ghost") / "kanban.db").exists()
+            assert (kb.board_dir("ghost") / "board.json").is_file()
+
+    @pytest.mark.parametrize("archive", [True, False])
+    def test_remove_board_leaves_tombstone_in_archived_dir(
+        self, fresh_home, archive
+    ):
+        # The official `boards rm` flow must drop a tombstone board.json
+        # next to the archived/removed data so any straggler connect()
+        # from a stale cached process lands in an invisible, archived
+        # directory instead of a live-looking board (t_ffe0076d had to do
+        # this by hand before the fix).
+        kb.create_board("tomb")
+        with kb.connect(board="tomb"):
+            pass
+        result = kb.remove_board("tomb", archive=archive)
+        if archive:
+            tombstone = Path(result["new_path"]) / "board.json"
+        else:
+            tombstone = kb.board_dir("tomb") / "board.json"
+        assert tombstone.is_file()
+        meta = json.loads(tombstone.read_text(encoding="utf-8"))
+        assert meta.get("archived") is True
+        assert meta.get("slug") == "tomb"
+
+    def test_tombstoned_board_is_invisible_and_not_current(
+        self, fresh_home
+    ):
+        # A tombstoned dir left behind by a straggler connect() must stay
+        # invisible to list_boards() and must never resolve as the
+        # current board (the t_ffe0076d mitigation contract, now
+        # guaranteed for straggler-created ghosts too).
+        kb.create_board("haunt")
+        kb.set_current_board("haunt")
+        d = kb.board_dir("haunt")
+        # Simulate the tombstone a rm flow / straggler leaves behind.
+        kb.write_board_metadata("haunt", archived=True)
+        kb.remove_board("haunt", archive=False)
+        # remove_board(re-creates nothing itself); emulate the straggler
+        # by re-creating dir + tombstone only (no DB schema init through
+        # connect, which would now raise).
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "board.json").write_text(
+            json.dumps({"slug": "haunt", "archived": True}) + "\n",
+            encoding="utf-8",
+        )
+        assert kb.read_board_metadata("haunt").get("archived") is True
+        assert [b["slug"] for b in kb.list_boards(include_archived=False)] == [
+            "default"
+        ]
+        assert kb.get_current_board() == "default"
+
     def test_rename_updates_metadata(self, fresh_home):
         kb.create_board("slug-immutable")
         kb.write_board_metadata("slug-immutable", name="New Display Name")

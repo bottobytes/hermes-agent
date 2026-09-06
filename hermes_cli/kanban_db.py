@@ -1196,6 +1196,30 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _board_is_gone(slug: str) -> bool:
+    """Return True when ``slug`` no longer names a live board (t_bbdec489).
+
+    A board is gone when it has neither metadata nor a DB on disk, OR when
+    its only metadata is the tombstone left by :func:`remove_board` /
+    the rm flow (``archived: true`` board.json, no DB). Tombstoned dirs
+    are invisible to every enumerator and must never be resurrected by a
+    stale cached process — that is the exact ghost-board regression this
+    module guards against.
+    """
+    normed = _normalize_board_slug(slug)
+    if not normed or normed == DEFAULT_BOARD:
+        return False
+    if not board_exists(normed):
+        return True
+    meta = read_board_metadata(normed)
+    if not meta.get("archived"):
+        return False
+    # Archived metadata is only a tombstone when there is no live task DB
+    # behind it (archived boards reached via list_boards(include_archived=
+    # True) still carry their kanban.db and remain openable).
+    return not (board_dir(normed) / "kanban.db").exists()
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -1425,6 +1449,10 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    # Explicit (re-)creation clears the ghost-board refusal so the same
+    # process can open the board again (t_bbdec489).
+    with _INIT_LOCK:
+        _REMOVED_BOARD_SLUGS.discard(normed)
     meta = write_board_metadata(
         normed,
         name=name,
@@ -1513,6 +1541,31 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     # dropped first so the schema init pass re-runs on that fresh file.
     _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
 
+    # Tombstone (t_bbdec489): stamp the metadata as archived so any
+    # straggler that still opens the slug after removal lands in an
+    # invisible, archived directory instead of resurrecting a live-looking
+    # board. Written into the archive target (and back into the leftover
+    # dir on a hard delete) BEFORE the rename/rmtree so the marker ships
+    # with the data.
+    try:
+        write_board_metadata(
+            normed,
+            description=(
+                f"Board {normed!r} removed via `boards rm` at "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime())}. "
+                f"Tombstone: any straggler reopen must treat this board as "
+                f"archived and stay invisible. Data in this directory"
+                + (" (this archive)." if archive else " was deleted.")
+            ),
+            archived=True,
+        )
+    except Exception as exc:  # pragma: no cover - best-effort marker
+        _log.warning(
+            "remove_board: could not write tombstone board.json for %s (%s)",
+            normed,
+            exc,
+        )
+
     if archive:
         archive_root = boards_root() / "_archived"
         archive_root.mkdir(parents=True, exist_ok=True)
@@ -1528,6 +1581,25 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     else:
         import shutil
         shutil.rmtree(d)
+        # Hard delete: leave the tombstoned metadata dir in place (no DB)
+        # so reactive stragglers see an archived, DB-less directory —
+        # invisible to every enumerator instead of a resurrected board.
+        try:
+            write_board_metadata(
+                normed,
+                description=(
+                    f"Board {normed!r} deleted via `boards rm` at "
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime())}. "
+                    f"Tombstone: data was permanently deleted."
+                ),
+                archived=True,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort marker
+            _log.warning(
+                "remove_board: could not leave tombstone board.json for %s (%s)",
+                normed,
+                exc,
+            )
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
@@ -2077,6 +2149,12 @@ CREATE INDEX IF NOT EXISTS idx_restart_windows_open  ON kanban_restart_windows(c
 # ---------------------------------------------------------------------------
 
 _INITIALIZED_PATHS: set[str] = set()
+# Slugs this process has refused to resurrect (ghost-board guard,
+# t_bbdec489). Once a slug lands here, connect()/init_db() keep refusing
+# until the board genuinely exists on disk again (e.g. the user re-creates
+# it or restores the archive) — a bare follow-up open must not mkdir the
+# removed directory back into existence.
+_REMOVED_BOARD_SLUGS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
@@ -2417,6 +2495,23 @@ def _validate_sqlite_header(path: Path) -> None:
         "file is not a database: invalid SQLite header for "
         f"{path}{signature}; first_32={head[:32].hex(' ')}"
     )
+
+
+class BoardRemovedError(RuntimeError):
+    """Raised when a caller opens a removed board that its process still
+    has cached.
+
+    A long-lived process (the gateway dispatcher) keeps a per-path
+    ``_INITIALIZED_PATHS`` cache entry for every board it has ever
+    opened. When another process removes the board directory, a stale
+    cache entry used to make the next ``connect(board=slug)`` recreate
+    the directory and a schema-complete empty DB — a "ghost board" that
+    reappeared within seconds of every removal (t_bbdec489,
+    2026-09-06). Instead of resurrecting, connect/init_db now raise
+    this so callers can drop the slug from rotation. The cache entry is
+    cleared before raising; retrying after the drop either resolves
+    elsewhere (env pin, pointer file) or falls back to ``default``.
+    """
 
 
 class KanbanDbCorruptError(RuntimeError):
@@ -2896,6 +2991,36 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Ghost-board guard (t_bbdec489): if the slug was removed while this
+    # process still holds an init-cache entry for its DB path, refuse to
+    # resurrect it. Without this, the mkdir below recreates the removed
+    # directory and a schema-complete empty DB reappears within one poll
+    # tick of every `boards rm` (observed 6s after removal on 2026-09-06).
+    # Only the cache-pinned path needs the guard: a caller passing an
+    # explicit ``board=`` for a board that genuinely has no metadata on
+    # disk has already been rejected by higher layers (dashboard
+    # _resolve_board 404s, get_current_board falls through), and tests
+    # legitimately connect to bare tmp dirs via db_path=. The refusal is
+    # also sticky: once raised, the slug is remembered for this process
+    # so a follow-up init_db() (whose own cache precondition is gone)
+    # still refuses instead of resurrecting via a second mkdir.
+    if db_path is None and board is not None:
+        slug_guard = _normalize_board_slug(board)
+        if slug_guard and slug_guard != DEFAULT_BOARD:
+            stale_cached = str(path.resolve()) in _INITIALIZED_PATHS
+            tombstoned = slug_guard in _REMOVED_BOARD_SLUGS
+            if (
+                (stale_cached or tombstoned)
+                and _board_is_gone(slug_guard)
+            ):
+                with _INIT_LOCK:
+                    _INITIALIZED_PATHS.discard(str(path.resolve()))
+                    _REMOVED_BOARD_SLUGS.add(slug_guard)
+                raise BoardRemovedError(
+                    f"board {slug_guard!r} was removed but this process "
+                    f"still had {path} cached; refusing to resurrect it. "
+                    f"The stale cache entry has been dropped."
+                )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2944,9 +3069,40 @@ def connect(
         # the board just renders empty (#83445). Drop the stale cache entry and
         # fall through to the full init path, which re-runs the header and
         # integrity probes and the schema script under the cross-process lock.
+        # Ghost-board refinement (t_bbdec489): when the slug itself was
+        # removed (the directory was only resurrected by the mkdir above),
+        # re-initializing would rebuild a schema-complete ghost. Refuse and
+        # clean up instead — same contract as the pre-open guard.
         conn.close()
         with _INIT_LOCK:
             _INITIALIZED_PATHS.discard(resolved)
+        if db_path is None and board is not None:
+            slug_gone = _normalize_board_slug(board)
+            if (
+                slug_gone
+                and slug_gone != DEFAULT_BOARD
+                and _board_is_gone(slug_gone)
+            ):
+                _log.warning(
+                    "kanban board %r was removed while this process had it "
+                    "cached; dropping resurrected empty DB at %s and "
+                    "refusing to re-initialize it.",
+                    slug_gone,
+                    path,
+                )
+                with _INIT_LOCK:
+                    _REMOVED_BOARD_SLUGS.add(slug_gone)
+                try:
+                    path.unlink(missing_ok=True)
+                    path.with_name(path.name + "-wal").unlink(missing_ok=True)
+                    path.with_name(path.name + "-shm").unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise BoardRemovedError(
+                    f"board {slug_gone!r} was removed but this process "
+                    f"still had {path} cached; refusing to resurrect it. "
+                    f"The stale cache entry has been dropped."
+                )
         _log.warning(
             "kanban DB %s lost its schema after this process initialized it "
             "(deleted or replaced externally); re-initializing.",
@@ -3071,6 +3227,25 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # Ghost-board guard — same contract as connect() (t_bbdec489): never
+    # mkdir + schema-init a slug whose board directory no longer exists.
+    if db_path is None and board is not None:
+        slug_guard = _normalize_board_slug(board)
+        if slug_guard and slug_guard != DEFAULT_BOARD:
+            stale_cached = str(path.resolve()) in _INITIALIZED_PATHS
+            tombstoned = slug_guard in _REMOVED_BOARD_SLUGS
+            if (
+                (stale_cached or tombstoned)
+                and _board_is_gone(slug_guard)
+            ):
+                with _INIT_LOCK:
+                    _INITIALIZED_PATHS.discard(str(path.resolve()))
+                    _REMOVED_BOARD_SLUGS.add(slug_guard)
+                raise BoardRemovedError(
+                    f"board {slug_guard!r} was removed but this process "
+                    f"still had {path} cached; refusing to resurrect it. "
+                    f"The stale cache entry has been dropped."
+                )
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
