@@ -2794,6 +2794,25 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Per-profile cap OVERRIDES (t_3c8f043d). Mapping of profile name
+        # to the per-profile concurrency cap that wins over the scalar
+        # max_in_progress_per_profile for that profile. Profiles not listed
+        # keep the scalar (or no cap when the scalar is unset). Lets an
+        # operator match each lane's concurrency to its model's documented
+        # API concurrency limit — e.g. a dedicated reviewer profile on a
+        # high-limit key separate from implementer fan-out profiles.
+        # Invalid entries are dropped at read time.
+        "max_in_progress_per_profile_map": None,
+        # Default reviewer profile (t_3c8f043d). When a review_requested
+        # event carries no explicit reviewer (and there is no re-review
+        # provenance to reuse), the card is reassigned to this profile so
+        # reviews stop defaulting to the IMPLEMENTER's profile — a busy
+        # implementer at its per-profile concurrency cap used to starve its
+        # own review indefinitely. Empty/unset keeps the legacy
+        # implementer-profile fallback; an explicit reviewer= on
+        # kanban_request_review / the CLI always wins; a configured name
+        # that is not a real profile is ignored (fail-open).
+        "default_reviewer": "",
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

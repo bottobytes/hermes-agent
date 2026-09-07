@@ -8202,6 +8202,30 @@ def request_review(
                         "malformed); pass reviewer= explicitly",
                     )
                 reviewer = prior_reviewer
+        if reviewer is None:
+            # Default-reviewer routing (t_3c8f043d): when the caller passed
+            # no explicit reviewer and there is no re-review provenance to
+            # reuse, consult the operator-configured
+            # ``kanban.default_reviewer``. Previously the card stayed under
+            # the IMPLEMENTER's profile, so a busy implementer profile (at
+            # its per-profile concurrency cap) starved its own review for as
+            # long as its lanes stayed full — the Sep-7 t_8eadda48 incident.
+            # Only a real profile is routed to; an unresolvable configured
+            # name falls back to the legacy implementer-profile behaviour
+            # (the dispatch lane's nonspawnable check + starve detector
+            # stay the safety net, and the event records why).
+            try:
+                _default_rev = default_reviewer_profile()
+            except Exception:
+                _default_rev = None
+            if _default_rev:
+                try:
+                    from hermes_cli.profiles import profile_exists as _dr_pe
+                except Exception:
+                    _dr_pe = None
+                _resolved = _dr_pe(_default_rev) if _dr_pe is not None else True
+                if _resolved:
+                    reviewer = _default_rev
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
@@ -12030,6 +12054,122 @@ def review_dispatch_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Board-level kanban config that must be readable from the ROOT home even
+# when the current process runs under a PROFILE home (t_3c8f043d).
+#
+# ``request_review`` executes inside the WORKER process (spawned with
+# ``HERMES_HOME=<profiles/<assignee>>``), but operator-level routing knobs
+# like ``kanban.default_reviewer`` live in the ROOT config the dispatcher/
+# gateway reads. ``load_config()`` in that context resolves to the profile's
+# own config.yaml, so a plain read would silently miss the knob. These
+# helpers resolve the root config explicitly:
+#
+#   1. ``$HERMES_KANBAN_ROOT_CONFIG`` (absolute path — test seam / override)
+#   2. ``$HERMES_REAL_HOME/.hermes/config.yaml`` (dispatcher-spawned workers
+#      carry HERMES_REAL_HOME pointing at the real user home)
+#   3. the current ``get_config_path()`` (vanilla CLI installs where the
+#      active home IS the root home)
+#
+# First candidate that exists wins; every reader fails closed to the legacy
+# behaviour (None / {}) on any error, so a broken root config can never wedge
+# the review lane.
+# ---------------------------------------------------------------------------
+
+
+def _root_kanban_cfg_candidates() -> list:
+    """Ordered list of (label, Path) root-config candidates."""
+    from pathlib import Path
+
+    candidates = []
+    env_override = os.environ.get("HERMES_KANBAN_ROOT_CONFIG", "").strip()
+    if env_override:
+        candidates.append(("env", Path(env_override)))
+    real_home = os.environ.get("HERMES_REAL_HOME", "").strip()
+    if real_home:
+        candidates.append(("real_home", Path(real_home) / ".hermes" / "config.yaml"))
+    try:
+        from hermes_cli.config import get_config_path
+
+        candidates.append(("config_path", Path(get_config_path())))
+    except Exception:
+        pass
+    return candidates
+
+
+_root_kanban_cfg_cache: dict = {}
+_root_kanban_cfg_cache_lock = threading.Lock()
+
+
+def _load_root_kanban_cfg() -> dict:
+    """Read the ``kanban:`` mapping from the resolved root config.
+
+    Plain YAML parse (not ``load_config``) so this works regardless of which
+    profile home is active. Result is cached per (path, mtime_ns, size) so a
+    review-request burst doesn't re-parse YAML per call.
+    """
+    import yaml
+
+    for _label, path in _root_kanban_cfg_candidates():
+        try:
+            st = path.stat()
+            sig = (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
+        with _root_kanban_cfg_cache_lock:
+            hit = _root_kanban_cfg_cache.get("hit")
+            if hit is not None and hit[0] == sig:
+                return hit[1]
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = yaml.safe_load(f) or {}
+            kanban_cfg = doc.get("kanban") if isinstance(doc, dict) else None
+            kanban_cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
+        except Exception:
+            kanban_cfg = {}
+        with _root_kanban_cfg_cache_lock:
+            _root_kanban_cfg_cache["hit"] = (sig, kanban_cfg)
+        return kanban_cfg
+    return {}
+
+
+def default_reviewer_profile() -> Optional[str]:
+    """Operator-configured default reviewer profile (``kanban.default_reviewer``).
+
+    Returns the stripped name or ``None`` when unset/blank. Pure string read —
+    callers decide whether the name resolves to a real profile (fail-open
+    contract shared with the dispatch-side profile checks). Explicit
+    ``reviewer=`` on the tool call always wins over this default.
+    """
+    raw = _load_root_kanban_cfg().get("default_reviewer")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def per_profile_cap_map() -> dict:
+    """Per-profile concurrency-cap overrides (t_3c8f043d).
+
+    ``kanban.max_in_progress_per_profile_map`` — mapping of profile name to
+    the per-profile cap that wins over the scalar
+    ``max_in_progress_per_profile`` for that profile. Keys are normalized
+    (stripped + lowercased; task assignees are stored normalized). Invalid
+    entries (non-int, < 1, booleans) are dropped; a non-dict value yields
+    ``{}``.
+    """
+    raw = _load_root_kanban_cfg().get("max_in_progress_per_profile_map")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for pname, pcap in raw.items():
+        if isinstance(pcap, bool) or not isinstance(pcap, int) or pcap < 1:
+            continue
+        key = str(pname or "").strip().lower()
+        if key:
+            out[key] = pcap
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
 # Two production incidents ("larrikin-lollies", "synclare-task-manager")
@@ -12567,8 +12707,32 @@ def _dispatch_once_locked(
         isinstance(max_in_progress_per_profile, int)
         and max_in_progress_per_profile > 0
     ) else None
+    # Per-profile cap overrides (t_3c8f043d): ``kanban.max_in_progress_per_
+    # profile_map`` lets the operator give one profile a different cap than
+    # the scalar ``max_in_progress_per_profile`` — e.g. a dedicated reviewer
+    # lane on a different model/API quota than the implementer fan-out
+    # profiles. Map wins over the scalar for that profile; unlisted profiles
+    # keep the scalar (or no cap when the scalar is unset). Fail-open: a
+    # broken/unreadable root config yields an empty map = scalar-only
+    # behaviour, exactly the pre-t_3c8f043d semantics.
+    _per_profile_caps: dict = {}
+    try:
+        _per_profile_caps = dict(per_profile_cap_map())
+    except Exception:
+        _per_profile_caps = {}
+    _any_profile_cap = _per_profile_cap is not None or bool(_per_profile_caps)
+
+    def _cap_for(assignee: Optional[str]) -> Optional[int]:
+        """Effective per-profile cap for one assignee (map > scalar > None)."""
+        if not assignee:
+            return None
+        mapped = _per_profile_caps.get(str(assignee).strip().lower())
+        if isinstance(mapped, int) and mapped > 0:
+            return mapped
+        return _per_profile_cap
+
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+    if _any_profile_cap:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
@@ -12666,10 +12830,12 @@ def _dispatch_once_locked(
         # its in-flight cap. Prevents one profile's local model / API
         # quota / browser pool from being overwhelmed by a fan-out
         # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
+        # work on OTHER profiles. t_3c8f043d: the per-profile map
+        # overrides the scalar for profiles it lists.
+        _row_cap = _cap_for(row_assignee)
+        if _row_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
+            if current >= _row_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row_assignee, current)
                 )
@@ -12702,7 +12868,7 @@ def _dispatch_once_locked(
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
+            if _any_profile_cap and row_assignee:
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
@@ -12764,7 +12930,7 @@ def _dispatch_once_locked(
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
-            if _per_profile_cap is not None and claimed.assignee:
+            if _any_profile_cap and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
@@ -12809,9 +12975,10 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
+        _review_cap = _cap_for(row["assignee"])
+        if _review_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
+            if current >= _review_cap:
                 result.skipped_per_profile_capped.append(
                     (row["id"], row["assignee"], current)
                 )
@@ -12829,7 +12996,7 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             spawned += 1
-            if _per_profile_cap is not None:
+            if _any_profile_cap:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
                 )
@@ -12884,7 +13051,7 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
-            if _per_profile_cap is not None and claimed.assignee:
+            if _any_profile_cap and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )

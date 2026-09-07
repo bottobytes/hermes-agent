@@ -1662,6 +1662,31 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # t_3c8f043d: log the per-profile cap OVERRIDE map (read inside each
+        # dispatch tick via kb.per_profile_cap_map(); logged here once at
+        # startup as restart-verification evidence). Fail-open: an empty or
+        # unreadable map just means scalar-only behaviour.
+        try:
+            _cap_map = dict(_kb.per_profile_cap_map())
+        except Exception:
+            _cap_map = {}
+        if _cap_map:
+            logger.info(
+                "kanban dispatcher: max_in_progress_per_profile_map=%s "
+                "(per-profile overrides of the scalar cap)",
+                _cap_map,
+            )
+        try:
+            _default_reviewer = _kb.default_reviewer_profile()
+        except Exception:
+            _default_reviewer = None
+        if _default_reviewer:
+            logger.info(
+                "kanban dispatcher: default_reviewer=%r (review_requested "
+                "events with no explicit reviewer route here)",
+                _default_reviewer,
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
