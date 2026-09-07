@@ -2423,15 +2423,23 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
+            ok, block_reason = kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
-            ):
+                with_reason=True,
+            )
+            if not ok:
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
+                # t_17cda1e8: kernel refusal reasons are actionable (e.g. a
+                # vacuous dependency block) — print them so the operator sees
+                # WHY and what to do instead of a bare "cannot block".
+                print(
+                    f"cannot block {tid}: {block_reason}",
+                    file=sys.stderr,
+                )
             else:
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.

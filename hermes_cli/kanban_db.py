@@ -7867,7 +7867,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
-) -> bool:
+    with_reason: bool = False,
+):
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
     ``kind`` (one of :data:`VALID_BLOCK_KINDS`, or ``None`` for a legacy
@@ -7879,6 +7880,18 @@ def block_task(
       ``todo`` so the existing parent-gating / ``recompute_ready`` machinery
       promotes it automatically once its parents finish. No human, no cron, no
       retry storm. This is Dale's "Type 2 — dependency blocked".
+
+      A dependency block is REFUSED when it would be vacuous — when the
+      parents are already satisfied (every parent ``done``/``archived``, or
+      no parents at all). Such a wait can never end: ``recompute_ready``
+      promotes every ``todo`` card whose parents are terminal, so parking a
+      satisfied-parents card in ``todo`` just makes the dispatcher respawn
+      the worker on the next tick, forever (observed live on t_52135e4c,
+      2026-09-07: one V4 spawn per dispatch tick pair, 24 s from block to
+      auto-promotion). The card stays in its current status and the caller
+      learns why via ``with_reason=True`` — the fix is to block
+      ``needs_input`` (sticky, human-visible) or complete, not to wait on a
+      dependency that has already fired. (t_17cda1e8)
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
@@ -7893,12 +7906,19 @@ def block_task(
       in the loop breaker so a forever-flaky task eventually escalates.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    ``triage``), False when the task wasn't in a blockable state. With
+    ``with_reason=True`` returns ``(ok, reason)`` mirroring
+    :func:`request_review` — ``reason`` is a diagnostic string on failure,
+    ``None`` on success.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+
+    def _ret(ok: bool, why: Optional[str] = None):
+        return (ok, why) if with_reason else ok
+
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -7906,7 +7926,7 @@ def block_task(
             (task_id,),
         ).fetchone()
         if cur_row is None:
-            return False
+            return _ret(False, "task not found")
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -7925,6 +7945,26 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            # Vacuous-wait guard (t_17cda1e8): if the parents are already
+            # satisfied (all done/archived, or no parents at all), parking in
+            # todo is a wait that can never end — recompute_ready promotes
+            # every todo card with satisfied parents on the next dispatcher
+            # tick, respawning the worker in an infinite loop (observed live
+            # on t_52135e4c, 2026-09-07). Refuse instead: the card keeps its
+            # current status, nothing is written, and the caller is told to
+            # use kind='needs_input' (sticky — no auto-promote) for external
+            # waits, or kanban_complete if the work is actually done.
+            if _parents_satisfied(conn, task_id):
+                return _ret(
+                    False,
+                    "dependency block refused: parent dependencies are "
+                    "already satisfied (all done/archived, or no parents) — "
+                    "recompute_ready would auto-promote this task from todo "
+                    "on the next dispatcher tick and respawn the worker in a "
+                    "loop. For an external event or human decision, block "
+                    "with kind='needs_input' (sticky, no auto-promote) "
+                    "instead; if the work is done, call kanban_complete.",
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -7940,7 +7980,11 @@ def block_task(
                 else (kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
-                return False
+                return _ret(
+                    False,
+                    "task is not in running/ready (unknown id or already "
+                    "transitioned)",
+                )
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -7968,7 +8012,7 @@ def block_task(
                 run_id=run_id,
                 reason=reason,
             )
-            return True
+            return _ret(True)
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
@@ -7998,7 +8042,7 @@ def block_task(
                 else (kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
-                return False
+                return _ret(False, "task is not in running/ready")
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -8052,7 +8096,7 @@ def block_task(
                     (kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
-                return False
+                return _ret(False, "task is not in running/ready")
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -8085,7 +8129,7 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
-    return True
+    return _ret(True)
 
 
 

@@ -921,16 +921,19 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
-            ok = kb.block_task(
+            ok, block_reason = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                with_reason=True,
             )
             if not ok:
+                # t_17cda1e8: kernel refusal reasons are actionable (e.g. a
+                # vacuous dependency block) — surface them verbatim so the
+                # worker can correct the call instead of retrying it blind.
                 return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"could not block {tid}: {block_reason}"
                 )
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
