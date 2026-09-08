@@ -2842,6 +2842,30 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # t_67d80b05: dispatcher stuck-escalation threshold. When the
+        # gateway's dispatch telemetry sees the ready queue non-empty with
+        # 0 workers spawned for this many consecutive ticks (≈ minutes at
+        # the 60s default interval), ONE aggregate triage card is filed
+        # under ``stuck_escalation_assignee`` with the full stuck
+        # signature — in addition to the per-card ``respawn_starved``
+        # subscriber wakes from the ready-lane starvation detector.
+        # Idempotent per incident (idempotency key on the live stuck-card
+        # signature). 0 disables the escalation card (the per-tick
+        # WARNING log and the per-card detector remain).
+        "stuck_escalation_ticks": 30,
+        # t_67d80b05: ready-lane starvation threshold (seconds). A ready
+        # card under a REAL profile that has not spawned for this long —
+        # typically held by the respawn guard's blocker_auth /
+        # rate_limit_cooldown rules — gets a ``respawn_starved`` event
+        # (wakes the card's subscriber) + a dispatcher comment naming the
+        # dominant guard reason. Idempotent per episode. 0 flags on the
+        # first eligible tick (tests).
+        "respawn_starved_seconds": 1800,
+        # t_67d80b05: assignee of the auto-created dispatcher-stuck
+        # escalation triage card. Must be a real Hermes profile; a
+        # configured name that does not resolve falls back to a blocked
+        # card carrying the misconfiguration in its title.
+        "stuck_escalation_assignee": "hermes-sysop",
     },
 
     # Bot Mode cross-connection relay (tools/bot_relay.py). Envelopes queued

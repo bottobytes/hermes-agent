@@ -280,7 +280,7 @@ class GatewayKanbanWatchersMixin:
         # (Pre-t_39ece1cd this was two assignments where the second silently
         # shadowed the first — merged into one tuple so every kind listed
         # here actually takes effect.)
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "assignee_unreachable", "review_spawn_starved", "rate_limited", "changes_requested", "restart_orphan")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "assignee_unreachable", "review_spawn_starved", "rate_limited", "changes_requested", "restart_orphan", "respawn_starved")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -792,6 +792,36 @@ class GatewayKanbanWatchersMixin:
                                 f" spawned{_mins}. Check per-profile cap / crash loop /"
                                 f" dispatcher review lane."
                             )
+                        elif kind == "respawn_starved":
+                            # Ready-lane starvation detector (t_67d80b05):
+                            # the card sits in ready under a VALID profile
+                            # while the respawn guard (or another silent
+                            # defer) keeps refusing to spawn it — per-tick
+                            # respawn_guarded events that no terminal set
+                            # carried, so the silence was total until the
+                            # board was eyeballed (t_c5b9190f: 696 guard
+                            # events, ~20h, zero wakes).
+                            _who = ""
+                            _mins = ""
+                            _why = ""
+                            if ev.payload:
+                                if ev.payload.get("assignee"):
+                                    _who = f"@{str(ev.payload['assignee'])}"
+                                _age = ev.payload.get("age_seconds")
+                                if _age:
+                                    try:
+                                        _mins = f" for {int(_age) // 60} min"
+                                    except (TypeError, ValueError):
+                                        _mins = ""
+                                _gr = ev.payload.get("guard_reason")
+                                if _gr:
+                                    _why = f" (guard: {_gr})"
+                            msg = (
+                                f"⏳ {board_tag}{tag}Kanban {sub['task_id']} in ready"
+                                f" under {_who or '(?)'} — valid profile but never"
+                                f" spawned{_mins}{_why}. Check respawn guard /"
+                                f" quota wall / reassign."
+                            )
                         elif kind == "rate_limited":
                             # t_e586ea59: honest quota-wall notification. The
                             # worker died to a provider quota/rate wall; the
@@ -1009,6 +1039,7 @@ class GatewayKanbanWatchersMixin:
                             "block_loop_detected", "assignee_unreachable",
                             "review_spawn_starved",
                             "rate_limited", "restart_orphan",
+                            "respawn_starved",
                         )
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
@@ -1064,6 +1095,7 @@ class GatewayKanbanWatchersMixin:
                             if "block_loop_detected" in _wake_kinds: _parts.append(t("gateway.kanban.wake.block_loop_detected"))
                             if "assignee_unreachable" in _wake_kinds: _parts.append(t("gateway.kanban.wake.assignee_unreachable"))
                             if "review_spawn_starved" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review_spawn_starved"))
+                            if "respawn_starved" in _wake_kinds: _parts.append(t("gateway.kanban.wake.respawn_starved"))
                             if "rate_limited" in _wake_kinds: _parts.append(t("gateway.kanban.wake.rate_limited"))
                             if "restart_orphan" in _wake_kinds: _parts.append(t("gateway.kanban.wake.restart_orphan"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
@@ -1698,6 +1730,17 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        # t_67d80b05: escalation state for the same telemetry. Fires once
+        # per stuck episode when bad_ticks crosses the escalation
+        # threshold: an aggregate triage card lands on the board with the
+        # full stuck signature (per-card teeth come from the kernel's
+        # respawn-starved detector, which wakes each card's subscriber at
+        # the 30-minute starvation threshold). ``_stuck_escalated_key``
+        # dedupes: the card idempotency key is derived from the live
+        # ready-stuck signature, so the SAME wedge never files twice (the
+        # tick-gated probe below only re-arms after the key changes).
+        _stuck_escalated_key: Optional[str] = None
+        _stuck_last_probe_at = 0.0
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -2039,6 +2082,7 @@ class GatewayKanbanWatchersMixin:
                             continue
                         _unreach = list(getattr(res, "flagged_unreachable", None) or [])
                         _starved = list(getattr(res, "review_spawn_starved", None) or [])
+                        _rstarved = list(getattr(res, "respawn_starved", None) or [])
                         if _unreach or _starved:
                             logger.warning(
                                 "kanban dispatcher [%s]: REVIEW-LANE STALL — "
@@ -2046,6 +2090,21 @@ class GatewayKanbanWatchersMixin:
                                 "(subscribers woken; reassign or check reviewer "
                                 "profile/caps; see card comments)",
                                 slug, _unreach, _starved,
+                            )
+                        if _rstarved:
+                            # t_67d80b05: ready-lane starvation — per-card
+                            # comments + subscriber wakes already fired in
+                            # the kernel detector; this line makes the same
+                            # signal visible in the gateway log the Captain
+                            # watches, at WARNING like its review-lane
+                            # sibling. Episode-idempotent upstream, so once
+                            # per stall episode, not per tick.
+                            logger.warning(
+                                "kanban dispatcher [%s]: READY-LANE STALL — "
+                                "respawn_starved=%s (subscribers woken; check "
+                                "respawn guard / quota walls; see card "
+                                "comments; detector t_67d80b05)",
+                                slug, _rstarved,
                             )
                     # Rate-limited early signal (≤1 per 5 min per gateway):
                     # cards the dispatcher refuses to spawn because the
@@ -2083,6 +2142,91 @@ class GatewayKanbanWatchersMixin:
                             bad_ticks,
                         )
                         last_warn_at = now
+                # t_67d80b05: give the detector teeth. Once the streak
+                # crosses the escalation threshold, file ONE aggregate
+                # triage card per incident (kernel-side idempotency on the
+                # live ready-stuck signature). The escalation runs at most
+                # once per 5 minutes — the same cadence as the warning —
+                # because computing the signature opens a board DB, and a
+                # sustained wedge should not burn a snapshot query on every
+                # tick. The card-create path itself is idempotent, so even
+                # two racing probes yield one card.
+                try:
+                    _esc_threshold = _kb.resolve_stuck_escalation_ticks()
+                except Exception:
+                    _esc_threshold = 0
+                if (
+                    _esc_threshold > 0
+                    and bad_ticks >= _esc_threshold
+                    and time.time() - _stuck_last_probe_at >= 300.0
+                ):
+                    _stuck_last_probe_at = time.time()
+
+                    def _stuck_escalate() -> Optional[tuple]:
+                        """Probe the stuck signature and maybe escalate.
+
+                        Returns (escalated_card_id, key) when a card was
+                        filed this probe (fresh or existing), else None.
+                        Runs in a worker thread — board DB I/O off the
+                        event loop, same as every other dispatch-side
+                        probe here.
+                        """
+                        try:
+                            boards = _kb.list_boards(include_archived=False)
+                        except Exception:
+                            boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                        for b in boards:
+                            slug = b.get("slug") or _kb.DEFAULT_BOARD
+                            conn = None
+                            try:
+                                conn = _kb.connect(board=slug)
+                                if not _kb.has_spawnable_ready(conn):
+                                    continue
+                                snap = _kb.ready_stuck_snapshot(conn)
+                                if not snap:
+                                    continue
+                                key = _kb.stuck_escalation_idempotency_key(snap)
+                                if key == _stuck_escalated_key:
+                                    # Same incident already escalated this
+                                    # episode — never spam a second card.
+                                    return None
+                                card_id = _kb.escalate_dispatcher_stuck(
+                                    conn,
+                                    stuck_ticks=bad_ticks,
+                                    snapshot=snap,
+                                    board=slug,
+                                )
+                                if card_id:
+                                    return (card_id, key)
+                                return None
+                            except Exception:
+                                logger.debug(
+                                    "kanban dispatcher: stuck-escalation probe "
+                                    "failed on board %s", slug, exc_info=True,
+                                )
+                            finally:
+                                if conn is not None:
+                                    try:
+                                        conn.close()
+                                    except Exception:
+                                        pass
+                        return None
+
+                    _esc = await _to_thread_process_service(_stuck_escalate)
+                    if _esc is not None:
+                        _stuck_escalated_key = _esc[1]
+                        logger.error(
+                            "kanban dispatcher: STUCK-ESCALATION — %d ticks "
+                            "with spawnable ready work and 0 spawns; triage "
+                            "card %s filed for operator routing (detector "
+                            "t_67d80b05)",
+                            bad_ticks, _esc[0],
+                        )
+                elif bad_ticks == 0:
+                    # Healthy tick — re-arm the escalation episode so the
+                    # NEXT wedge files a fresh card even if its signature
+                    # happens to collide with the previous incident's.
+                    _stuck_escalated_key = None
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

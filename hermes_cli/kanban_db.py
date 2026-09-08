@@ -448,6 +448,40 @@ DEFAULT_UNREACHABLE_ASSIGNEE_GRACE_SECONDS_REVIEW = 15 * 60  # 15 minutes
 # ``HERMES_KANBAN_REVIEW_SPAWN_STARVED_SECONDS`` (0 = first tick; tests).
 DEFAULT_REVIEW_SPAWN_STARVED_SECONDS = 30 * 60  # 30 minutes
 
+# t_67d80b05: starvation threshold for READY cards stuck behind the respawn
+# guard (``blocker_auth`` / ``rate_limit_cooldown`` / ``recent_success`` /
+# ``active_pr``) or any other silent defer — t_c5b9190f sat in ready for ~20h
+# with 696 consecutive ``respawn_guarded`` events and nothing woke anyone.
+# The guard emits a per-tick event but those events are invisible to
+# subscribers (``respawn_guarded`` is in no notifier terminal set), so a card
+# held by a deterministic blocker (quota-flavored crash text that never
+# clears) is dead silence. This detector is the ready-lane sibling of
+# ``detect_review_spawn_starved``: age from the row's latest lifecycle event,
+# fire once per episode, wake via a notifier-terminal event + board comment.
+# Override via ``kanban.respawn_starved_seconds`` or
+# ``HERMES_KANBAN_RESPAWN_STARVED_SECONDS`` (0 = first tick; tests).
+DEFAULT_RESPAWN_STARVED_SECONDS = 30 * 60  # 30 minutes
+
+# t_67d80b05: gateway stuck-escalation threshold. When the gateway's
+# dispatch-loop health telemetry logs ``kanban dispatcher stuck`` for this
+# many consecutive ticks (ready queue non-empty + 0 spawns), the escalation
+# lane fires: a dedicated triage card lands on the ops board under the
+# configured assignee, once per incident (dedupe via idempotency key on the
+# live ready-stuck signature). t_c5b9190f reached N=671 (~11h of warnings,
+# ~174 log lines) with no escalation — the detector counted but had no
+# teeth. Override via ``kanban.stuck_escalation_ticks`` or
+# ``HERMES_KANBAN_STUCK_ESCALATION_TICKS`` (0 disables the escalation card;
+# the per-tick WARNING log stays).
+DEFAULT_STUCK_ESCALATION_TICKS = 30  # ≈30 min at the 60s dispatch interval
+
+# t_67d80b05: assignee of the auto-created escalation triage card. Triage
+# (not ready) so the auto-decomposer never fans it out and a human-shaped
+# ops profile owns the routing decision. Must be a REAL profile — the
+# dispatcher's nonspawnable guard skips phantom assignees and the write-time
+# validator (t_fbd0fb38) rejects them outright; the escalator falls back to
+# ``blocked`` status when the configured name does not resolve.
+DEFAULT_STUCK_ESCALATION_ASSIGNEE = "hermes-sysop"
+
 # --- t_09c47c8d: worker-crash diagnostics (upstream #54154 pattern) --------
 # When a worker dies and the dispatcher can only record ``pid N not alive``,
 # capture the death-time evidence (worker-log tail + kernel OOM/signal
@@ -5967,6 +6001,86 @@ def _resolve_review_spawn_starved_seconds() -> int:
     return DEFAULT_REVIEW_SPAWN_STARVED_SECONDS
 
 
+def _resolve_respawn_starved_seconds() -> int:
+    """Threshold for the ready-lane respawn-starvation detector (seconds).
+
+    ``HERMES_KANBAN_RESPAWN_STARVED_SECONDS`` env wins, then
+    ``kanban.respawn_starved_seconds`` in config.yaml, then the 30-minute
+    default. ``0`` flags on the first eligible tick (tests). Negative values
+    fall through to the default.
+    """
+    raw = os.environ.get("HERMES_KANBAN_RESPAWN_STARVED_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    try:
+        from hermes_cli.config import load_config
+
+        cfg_val = (
+            (load_config() or {}).get("kanban", {}) or {}
+        ).get("respawn_starved_seconds")
+        if cfg_val is not None:
+            parsed = int(cfg_val)
+            if parsed >= 0:
+                return parsed
+    except Exception:
+        pass
+    return DEFAULT_RESPAWN_STARVED_SECONDS
+
+
+def resolve_stuck_escalation_ticks() -> int:
+    """t_67d80b05 — gateway stuck-escalation threshold in dispatcher ticks.
+
+    ``HERMES_KANBAN_STUCK_ESCALATION_TICKS`` env wins, then
+    ``kanban.stuck_escalation_ticks`` in config.yaml, then the default (30
+    ticks ≈ 30 min at the 60s dispatch interval). ``0`` DISABLES the
+    escalation card (the per-tick WARNING log remains — it predates this
+    feature and is the cheap always-on signal). Negative values fall
+    through to the default.
+    """
+    raw = os.environ.get("HERMES_KANBAN_STUCK_ESCALATION_TICKS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    try:
+        from hermes_cli.config import load_config
+
+        cfg_val = (
+            (load_config() or {}).get("kanban", {}) or {}
+        ).get("stuck_escalation_ticks")
+        if cfg_val is not None:
+            parsed = int(cfg_val)
+            if parsed >= 0:
+                return parsed
+    except Exception:
+        pass
+    return DEFAULT_STUCK_ESCALATION_TICKS
+
+
+def stuck_escalation_assignee() -> str:
+    """t_67d80b05 — assignee for the auto-created escalation triage card.
+
+    ``kanban.stuck_escalation_assignee`` from the ROOT config (resolved via
+    the same candidate chain as the other operator routing knobs, so the
+    gateway reading a profile home still sees the operator's value), else
+    ``hermes-sysop``. A blank/whitespace value falls back to the default —
+    an empty assignee would make the card unspawnable, defeating the
+    escalation.
+    """
+    raw = _load_root_kanban_cfg().get("stuck_escalation_assignee")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return DEFAULT_STUCK_ESCALATION_ASSIGNEE
+
+
 # Events that re-arm the starvation detector for a new episode: a fresh
 # review handoff (review_requested), an explicit routing change (assigned),
 # or a reviewer that actually claimed the card (claimed — the lane worked
@@ -6111,6 +6225,230 @@ def detect_review_spawn_starved(
     if flagged:
         _log.warning(
             "kanban: review-spawn-starved detector flagged %d card(s): %s",
+            len(flagged), ", ".join(flagged),
+        )
+    return flagged
+
+
+# t_67d80b05: events that re-arm the ready-lane respawn-starvation detector
+# for a new episode. A fresh claim/spawn means the lane worked once (a later
+# stall is a NEW episode worth waking on); ``assigned``/``status`` are
+# explicit operator routing actions (a reassign clears last_failure_error,
+# so the guard stops holding the card — but if it doesn't, the operator
+# needs to know); ``reclaimed``/``unblocked`` restart the retry cycle.
+_RESPAWN_STARVE_REARM_KINDS = (
+    "claimed", "spawned", "assigned", "status", "reclaimed", "unblocked",
+)
+
+
+def _dominant_guard_reason(conn: sqlite3.Connection, task_id: str, since: int) -> str:
+    """Most recent ``respawn_guarded`` reason for ``task_id`` since ``since``.
+
+    Returns the reason string (e.g. ``blocker_auth``) or ``""`` when the
+    card has no guard events in the window — the starvation may come from
+    another silent skip (per-profile cap residue, spawn-failure loop that
+    keeps clearing itself, etc.), and the comment must not lie about the
+    cause.
+    """
+    try:
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'respawn_guarded' "
+            "  AND created_at >= ? ORDER BY id DESC LIMIT 1",
+            (task_id, since),
+        ).fetchone()
+    except sqlite3.Error:
+        return ""
+    if not row or not row["payload"]:
+        return ""
+    try:
+        payload = json.loads(row["payload"])
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return str(reason) if reason else ""
+
+
+def detect_respawn_starved(
+    conn: sqlite3.Connection, *, threshold_seconds: Optional[int] = None
+) -> list[str]:
+    """Flag ready cards whose spawn keeps getting silently deferred (t_67d80b05).
+
+    The t_c5b9190f postmortem: a worker died to a provider quota wall mid-
+    ``kanban_complete``, the crash classifier stamped a quota-flavored
+    ``last_failure_error`` WITHOUT counting a failure (protocol-violation
+    below-budget path), and the respawn guard's ``blocker_auth`` regex then
+    deferred the respawn BEFORE the claim on every tick — 696 consecutive
+    ``respawn_guarded`` events, ~20h of silence. ``respawn_guarded`` is in
+    no notifier terminal set, so no subscriber was woken; the only signal
+    was the gateway's aggregate WARNING log, which nobody reads until the
+    board looks stuck by eye.
+
+    This detector is the ready-lane sibling of
+    :func:`detect_review_spawn_starved`. Criteria per card:
+    ``status='ready'``, ``claim_lock IS NULL``, assignee verifies as a real
+    Hermes profile, and no re-arm event for more than ``threshold_seconds``
+    (age from the row's latest event; the guard's per-tick
+    ``respawn_guarded`` events are EXCLUDED from both the age clock and the
+    re-arm set — they are the disease, not the activity). When it fires:
+
+    * a ``respawn_starved`` event — registered in the notifier terminal
+      sets of BOTH wake paths (gateway watcher + WebUI kanban-notifier
+      plugin), so the card's subscriber is woken exactly once via the
+      existing cursor/event-id dedup, and
+    * a visible board comment naming the dominant guard reason and the
+      operator remedies (unblock / reassign / wait for the quota window).
+
+    Idempotent per episode, mirroring the review-lane detector: once fired,
+    it does NOT re-fire until a NEW re-arm event (claim/spawn/assign/
+    status/reclaim/unblock) restarts the episode — the per-tick
+    ``respawn_guarded`` stream does NOT re-arm it. The card is NOT blocked
+    or reassigned; routing stays a human/orchestrator decision (same
+    posture as the sibling detectors). A worker that eventually spawns
+    flips the card to ``running`` and the detector stops considering it.
+
+    Runs under the board's dispatch lock inside the dispatcher tick, so it
+    never races itself. Returns the task ids flagged this pass.
+    """
+    if threshold_seconds is None:
+        threshold_seconds = _resolve_respawn_starved_seconds()
+    if threshold_seconds < 0:
+        threshold_seconds = 0
+    exists_fn = _dispatch_profile_exists
+
+    now = int(time.time())
+    rows = conn.execute(
+        """
+        SELECT t.id, t.assignee, t.title,
+               COALESCE(
+                   (SELECT MAX(e.created_at) FROM task_events e
+                     WHERE e.task_id = t.id
+                       AND e.kind != 'respawn_guarded'),
+                   t.created_at
+               ) AS last_event_ts,
+               COALESCE(
+                   (SELECT MAX(r.id) FROM task_events r
+                     WHERE r.task_id = t.id
+                       AND r.kind IN ('claimed', 'spawned', 'assigned',
+                                      'status', 'reclaimed', 'unblocked')),
+                   0
+               ) AS rearm_event_id,
+               COALESCE(
+                   (SELECT MAX(g.id) FROM task_events g
+                     WHERE g.task_id = t.id
+                       AND g.kind = 'respawn_starved'),
+                   0
+               ) AS starved_event_id
+          FROM tasks t
+         WHERE t.status = 'ready'
+           AND t.claim_lock IS NULL
+           AND t.assignee IS NOT NULL
+           AND TRIM(t.assignee) != ''
+           AND t.assignee != 'default'
+        """
+    ).fetchall()
+    flagged: list[str] = []
+    for row in rows:
+        assignee = row["assignee"]
+        resolved = exists_fn(assignee)
+        if resolved is not True:
+            # Not a verified-real profile: the unreachable sweep owns that
+            # half (verified miss); "unknown" must never fire either
+            # detector (fail-open, same posture as the siblings).
+            continue
+        try:
+            age = now - int(row["last_event_ts"] or 0)
+        except (TypeError, ValueError):
+            continue
+        if age < threshold_seconds:
+            continue
+        rearm_id = int(row["rearm_event_id"] or 0)
+        starved_id = int(row["starved_event_id"] or 0)
+        # Episode idempotency: a starvation event NEWER than the latest
+        # re-arm event means this episode already woke the subscriber.
+        # (The per-tick respawn_guarded stream never re-arms, so an
+        # unresolved blocker wakes exactly once no matter how long it
+        # persists.)
+        if starved_id > rearm_id:
+            continue
+        reason = _dominant_guard_reason(
+            conn, row["id"], now - max(threshold_seconds, 1) * 10
+        )
+        # Re-check inside the txn: another writer may have flagged this
+        # card (or a worker claimed it) between SELECT and now.
+        with write_txn(conn):
+            still = conn.execute(
+                "SELECT 1 FROM tasks "
+                "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+                (row["id"],),
+            ).fetchone()
+            if not still:
+                continue
+            rearm_now = conn.execute(
+                "SELECT COALESCE(MAX(r.id), 0) FROM task_events r "
+                "WHERE r.task_id = ? AND r.kind IN ("
+                "'claimed', 'spawned', 'assigned', 'status', 'reclaimed',"
+                " 'unblocked')",
+                (row["id"],),
+            ).fetchone()
+            starved_now = conn.execute(
+                "SELECT COALESCE(MAX(g.id), 0) FROM task_events g "
+                "WHERE g.task_id = ? AND g.kind = 'respawn_starved'",
+                (row["id"],),
+            ).fetchone()
+            if (starved_now[0] or 0) > (rearm_now[0] or 0):
+                continue
+            _append_event(
+                conn,
+                row["id"],
+                "respawn_starved",
+                {
+                    "assignee": assignee,
+                    "age_seconds": age,
+                    "threshold_seconds": threshold_seconds,
+                    "guard_reason": reason,
+                    "flagged_by": "detect_respawn_starved",
+                },
+            )
+            _remedy = {
+                "blocker_auth": (
+                    "last_failure_error matches the quota/auth regex — "
+                    "reassign (clears the error) or wait for the provider "
+                    "quota window"
+                ),
+                "rate_limit_cooldown": (
+                    "rate-limit cooldown — respawns cheaply once the "
+                    "window clears; no action needed unless it recurs"
+                ),
+                "recent_success": (
+                    "recent completed run holding the card — requeue "
+                    "deliberately (status change) to force a re-run"
+                ),
+                "active_pr": (
+                    "recent PR URL comment holding the card — requeue "
+                    "deliberately (status change) to force a re-run"
+                ),
+            }.get(reason, "unknown defer cause — inspect respawn_guarded events")
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    row["id"],
+                    "dispatcher",
+                    (
+                        f"⚠️ Ready card under @{assignee} has not spawned "
+                        f"for {age // 60} min — the respawn guard keeps "
+                        f"deferring it (dominant reason: "
+                        f"{reason or 'none recorded'}). Remedy: {_remedy}. "
+                        f"(starvation detector t_67d80b05.)"
+                    ),
+                    now,
+                ),
+            )
+            flagged.append(row["id"])
+    if flagged:
+        _log.warning(
+            "kanban: respawn-starved detector flagged %d card(s): %s",
             len(flagged), ", ".join(flagged),
         )
     return flagged
@@ -9743,6 +10081,14 @@ class DispatchResult:
     ``review_spawn_starved`` event (wakes the card's subscriber) + a
     dispatcher comment. Idempotent per episode: empty until a new
     review_requested/assigned/claimed event re-arms it (t_f0393d9f)."""
+    respawn_starved: list[str] = field(default_factory=list)
+    """Task ids flagged by :func:`detect_respawn_starved` this tick — ready
+    cards under a VALID profile assignee that keep getting deferred by the
+    respawn guard (or any other silent skip) past the starvation threshold.
+    Each got a ``respawn_starved`` event (wakes the card's subscriber) + a
+    dispatcher comment naming the dominant guard reason. Idempotent per
+    episode: empty until a new claimed/spawned/reclaimed/status event
+    re-arms it (t_67d80b05, t_c5b9190f postmortem)."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -12024,6 +12370,224 @@ def check_respawn_guard(
     return None
 
 
+# ---------------------------------------------------------------------------
+# t_67d80b05: dispatcher stuck-escalation (detector with teeth)
+#
+# The gateway's health telemetry has counted "ready queue non-empty but 0
+# spawns" ticks since t_4ce2d942-era — and on the t_c5b9190f incident the
+# counter reached N=671 (~20h) with nothing but a rate-limited WARNING log
+# line every 5 minutes. The Captain found the zombie by eyeballing the
+# board the next morning. This module gives the detector teeth: once the
+# stuck streak crosses ``kanban.stuck_escalation_ticks`` (default 30), the
+# gateway escalates BOTH ways the card asked for:
+#
+#   (a) notifier — the stuck cards each already get a ``respawn_starved``
+#       event via ``detect_respawn_starved`` (per-card teeth, fires at the
+#       30-minute starvation threshold, wakes each card's subscriber), and
+#   (b) triage card — a single aggregate ops card under
+#       ``kanban.stuck_escalation_assignee`` (default hermes-sysop) with
+#       the full signature (stuck ids, guard reasons, tick count), created
+#       once per incident via idempotency key so a sustained wedge yields
+#       ONE card, not one per tick.
+#
+# The escalation card lands in ``triage`` (never dispatched, never
+# auto-decomposed — auto_decompose=false on this fleet) with
+# ``created_by='dispatcher'``. Closing or archiving the card and letting
+# the signature change both start a fresh incident.
+# ---------------------------------------------------------------------------
+
+
+def ready_stuck_snapshot(conn: sqlite3.Connection) -> list[dict]:
+    """Snapshot of ready+assigned+unclaimed cards under real profiles.
+
+    Each entry: ``id``, ``assignee``, ``age_seconds`` (from the card's
+    latest non-``respawn_guarded`` event, falling back to ``created_at``),
+    and ``guard_reason`` (dominant respawn-guard reason in the last 10x
+    threshold window, ``""`` when none recorded). This is the signature
+    the escalation card dedupes on — cheap enough to run once per
+    escalation decision, not once per tick.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists as _pe
+    except Exception:
+        _pe = None
+    now = int(time.time())
+    out: list[dict] = []
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.id, t.assignee,
+                   COALESCE(
+                       (SELECT MAX(e.created_at) FROM task_events e
+                         WHERE e.task_id = t.id
+                           AND e.kind != 'respawn_guarded'),
+                       t.created_at
+                   ) AS last_event_ts
+              FROM tasks t
+             WHERE t.status = 'ready'
+               AND t.claim_lock IS NULL
+               AND t.assignee IS NOT NULL
+               AND TRIM(t.assignee) != ''
+               AND t.assignee != 'default'
+             ORDER BY t.priority DESC, t.created_at ASC
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    for row in rows:
+        if _pe is not None and not _pe(row["assignee"]):
+            continue
+        try:
+            age = now - int(row["last_event_ts"] or 0)
+        except (TypeError, ValueError):
+            age = 0
+        out.append(
+            {
+                "id": row["id"],
+                "assignee": row["assignee"],
+                "age_seconds": max(age, 0),
+                "guard_reason": _dominant_guard_reason(
+                    conn, row["id"], now - 6 * 3600
+                ),
+            }
+        )
+    return out
+
+
+def stuck_escalation_idempotency_key(snapshot: list[dict]) -> str:
+    """Stable per-incident key: the sorted stuck-card ids + guard reasons.
+
+    Two consecutive ticks of the same wedge produce the same key → the
+    ``create_task(idempotency_key=...)`` short-circuit returns the existing
+    card. A card closing (id leaves the snapshot) or a new card joining
+    changes the key → a genuinely new incident escalates fresh.
+    """
+    parts = sorted(
+        f"{entry['id']}:{entry['guard_reason'] or '-'}" for entry in snapshot
+    )
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return f"dispatcher-stuck-escalation-{digest}"
+
+
+def _stuck_escalation_profile_ok(name: str) -> bool:
+    """True when ``name`` resolves to a real Hermes profile (fail-open)."""
+    try:
+        from hermes_cli.profiles import profile_exists as _pe
+        return bool(_pe(name))
+    except Exception:
+        return True
+
+
+def escalate_dispatcher_stuck(
+    conn: sqlite3.Connection,
+    *,
+    stuck_ticks: int,
+    snapshot: list[dict],
+    board: Optional[str] = None,
+    assignee: Optional[str] = None,
+    _create_task=None,
+) -> Optional[str]:
+    """Create the aggregate dispatcher-stuck escalation card (t_67d80b05).
+
+    Called by the gateway dispatch watcher when ``bad_ticks`` crosses
+    ``resolve_stuck_escalation_ticks()``. Creates ONE triage card per
+    incident (idempotency key on the live signature) assigned to
+    ``stuck_escalation_assignee()``. Returns the card id (existing or
+    fresh), or ``None`` when escalation is disabled/unconfigured or the
+    creation failed — the gateway treats ``None`` as "log only" and never
+    crashes the watcher on it.
+
+    The card body carries the full signature — stuck ids with assignees,
+    ages, dominant guard reasons, tick count — so the woken operator sees
+    the same picture the dispatcher saw, without re-deriving it.
+    """
+    threshold = resolve_stuck_escalation_ticks()
+    if threshold <= 0:
+        return None
+    who = (assignee or stuck_escalation_assignee() or "").strip()
+    if not who:
+        who = DEFAULT_STUCK_ESCALATION_ASSIGNEE
+    key = stuck_escalation_idempotency_key(snapshot)
+    lines = [
+        "## Dispatcher stuck escalation (t_67d80b05)",
+        "",
+        f"The ready queue has been non-empty with **0 workers spawned** for "
+        f"**{stuck_ticks} consecutive dispatcher ticks** "
+        f"(threshold: {threshold}). The dispatcher is refusing to spawn "
+        f"work that it itself considers spawnable.",
+        "",
+        "### Stuck cards (live signature)",
+        "",
+        "| task | assignee | silent for | guard reason |",
+        "|------|----------|-----------|--------------|",
+    ]
+    for entry in snapshot[:25]:
+        mins = entry.get("age_seconds", 0) // 60
+        lines.append(
+            f"| `{entry['id']}` | @{entry.get('assignee') or '?'} "
+            f"| {mins}m | {entry.get('guard_reason') or '—'} |"
+        )
+    if len(snapshot) > 25:
+        lines.append(f"| … | {len(snapshot) - 25} more | | |")
+    lines += [
+        "",
+        "### What to do",
+        "",
+        "- Inspect each card's `respawn_guarded` events "
+        "(`hermes kanban tail <id>`) for the dominant reason.",
+        "- `blocker_auth` after a quota wall: reassign the card to a profile"
+        " with quota (reassign clears `last_failure_error` and the guard),"
+        " or wait for the provider window.",
+        "- Work genuinely finished? Close the card — the dispatcher stops"
+        " counting it once the ready queue drains.",
+        "- This card is triage: it will never auto-spawn. Archive it when"
+        " the incident is handled; a NEW wedge with a different signature"
+        " escalates as a fresh incident.",
+        "",
+        f"_signature: {key} · ticks: {stuck_ticks} · detector: t_67d80b05_",
+    ]
+    body = "\n".join(lines)
+    create = _create_task or create_task
+    try:
+        if _stuck_escalation_profile_ok(who):
+            return create(
+                conn,
+                title=(
+                    f"[dispatcher-stuck] {len(snapshot)} ready card(s) "
+                    f"unspawned for {stuck_ticks} ticks — escalate/route"
+                ),
+                body=body,
+                assignee=who,
+                created_by="dispatcher",
+                triage=True,
+                idempotency_key=key,
+                board=board,
+            )
+        # Configured assignee is not a real profile: park the card as
+        # blocked instead of triage — a triage card under a phantom
+        # assignee would itself trip the unreachable-assignee sweep, and a
+        # ready card would sit in the very queue that is stuck. Blocked +
+        # created_by=dispatcher keeps it visible on the board without
+        # entering any dispatch lane.
+        return create(
+            conn,
+            title=(
+                f"[dispatcher-stuck] {len(snapshot)} ready card(s) "
+                f"unspawned for {stuck_ticks} ticks — escalate/route "
+                f"(assignee '{who}' is not a real profile; fix "
+                f"kanban.stuck_escalation_assignee)"
+            ),
+            body=body,
+            created_by="dispatcher",
+            initial_status="blocked",
+            idempotency_key=key,
+            board=board,
+        )
+    except Exception:
+        _log.exception("kanban dispatcher: stuck escalation card creation failed")
+        return None
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -12584,6 +13148,18 @@ def _dispatch_once_locked(
             result.review_spawn_starved = detect_review_spawn_starved(conn)
         except Exception:
             _log.exception("kanban dispatcher: review-spawn-starved detector failed")
+        # Ready-lane starvation detector (t_67d80b05): the sibling of the
+        # review detector for READY cards the dispatcher keeps silently
+        # deferring — respawn guard blockers (quota/auth regex, cooldown,
+        # recent_success, active_pr) write per-tick respawn_guarded events
+        # that no notifier terminal set carries, so t_c5b9190f sat ~20h
+        # with 696 guard events and zero wakes. Same passive posture: event
+        # (notifier-terminal on both wake paths) + comment, idempotent per
+        # episode, never mutates assignment.
+        try:
+            result.respawn_starved = detect_respawn_starved(conn)
+        except Exception:
+            _log.exception("kanban dispatcher: respawn-starved detector failed")
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )

@@ -188,6 +188,7 @@ gateway:
       restart_orphan: "orphaned by a container restart; requeued, no failure counted"
       assignee_unreachable: "parked under an unknown assignee; needs reassignment"
       review_spawn_starved: "in review but the reviewer never spawned; check caps/crash loop/review lane"
+      respawn_starved: "in ready but never spawned; check respawn guard / quota wall / reassign"
       status_default:      "status changed"
       status_joiner:       ", "
       message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
