@@ -608,6 +608,10 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao",
+    # t_993b18df: WebUI pseudo-platform -- local HTTP delivery, no gateway
+    # credentials (see _deliver_to_webui and the bot-chat-style preflight
+    # carve-out in _preflight_check_delivery).
+    "webui",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -2510,6 +2514,27 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
     if bot_chat_profile is not None:
         return _resolve_bot_chat_target(job, bot_chat_profile)
 
+    # t_993b18df: explicit webui:<session_id> targets. WebUI session ids are
+    # bare hex strings with no platform-native syntax -- the generic
+    # platform:target resolver below would bounce them off the channel
+    # directory (unknown platform "webui") and silently drop the target.
+    # Resolve directly, mirroring the bot-chat carve-out above.
+    if deliver_value.lower().startswith(WEBUI_DELIVERY_PLATFORM + ":"):
+        webui_sid = deliver_value.split(":", 1)[1].strip().lower()
+        if not _WEBUI_SESSION_ID_RE.fullmatch(webui_sid):
+            logger.warning(
+                "Invalid cron delivery target '%s': not a WebUI session id "
+                "(expected bare hex)",
+                deliver_value,
+            )
+            return None
+        return {
+            "platform": WEBUI_DELIVERY_PLATFORM,
+            "chat_id": webui_sid,
+            "thread_id": None,
+            "_resolved_from": "explicit",
+        }
+
     if deliver_value == "origin":
         if origin:
             return {
@@ -2736,6 +2761,171 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
                 pass
 
 
+def _webui_delivery_base_url() -> str:
+    """Base URL of this box's Hermes WebUI HTTP server (cron delivery lane).
+
+    The WebUI HTTP server and the gateway share one container / network
+    namespace in the standard deployment, so loopback is correct. Env
+    overrides: HERMES_CRON_WEBUI_DELIVERY_URL wins outright; otherwise the
+    WebUI's own HERMES_WEBUI_PORT (default 8787) on 127.0.0.1.
+    """
+    override = os.getenv("HERMES_CRON_WEBUI_DELIVERY_URL", "").strip()
+    if override:
+        return override.rstrip("/")
+    port = os.getenv("HERMES_WEBUI_PORT", "").strip() or "8787"
+    return f"http://127.0.0.1:{port}"
+
+
+def _webui_login(base_url: str, timeout: float) -> tuple:
+    """Authenticate to the WebUI HTTP API for a cron delivery (t_993b18df).
+
+    Returns ``(headers, error)``. When no HERMES_WEBUI_PASSWORD is set the
+    WebUI runs with auth disabled and the base header dict is returned (no
+    cookie needed). With a password, POST /api/auth/login (public +
+    CSRF-exempt) and lift the session cookie off Set-Cookie.
+
+    No CSRF token is required on the subsequent POST: the WebUI's CSRF gate
+    only applies to browser-identified requests (those carrying
+    Origin/Referer -- routes._check_csrf -> _is_browser_unsafe_request);
+    this lane deliberately sends neither header, matching the WebUI's
+    documented same-machine curl/API contract.
+    """
+    import urllib.error
+    import urllib.request
+
+    headers = {"Content-Type": "application/json"}
+    password = os.getenv("HERMES_WEBUI_PASSWORD", "").strip()
+    if not password:
+        return headers, None
+    req = urllib.request.Request(
+        base_url + "/api/auth/login",
+        data=json.dumps({"password": password}).encode("utf-8"),
+        headers=dict(headers),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            set_cookie = resp.headers.get("Set-Cookie", "") or ""
+    except urllib.error.HTTPError as e:
+        return None, f"webui delivery login failed (HTTP {e.code})"
+    except Exception as e:
+        return None, f"webui delivery login failed: {e or type(e).__name__}"
+    # Set-Cookie: name=value; Path=/; ...  ->  "name=value"
+    first = set_cookie.split(";", 1)[0].strip()
+    if "=" not in first:
+        return None, "webui delivery login returned no session cookie"
+    out = dict(headers)
+    out["Cookie"] = first
+    return out, None
+
+
+def _deliver_to_webui(job: dict, chat_id: str, content: str) -> Optional[str]:
+    """Deliver a cron report into a WebUI chat session (t_993b18df).
+
+    ``webui`` targets are Hermes WebUI browser sessions: the WebUI stamps
+    HERMES_SESSION_PLATFORM=webui / HERMES_SESSION_CHAT_ID=<webui session
+    id> when it runs an agent turn, so a deliver=origin job created there
+    carries origin {"platform": "webui"}. The WebUI is a separate HTTP
+    process from the gateway (no Platform member, no adapter), so delivery
+    POSTs the report to the WebUI's own ``POST /api/chat/start`` -- the
+    same server-side-turn entrypoint delegate_task completions and kanban
+    wakes use internally. The report lands as an automatic
+    ``[CRON DELIVERY]`` agent turn in the exact session that created (or
+    explicitly targeted) the job.
+
+    Success = the turn started (HTTP 2xx from chat/start, which returns as
+    soon as the agent worker is spawned). A 409 (the session already has an
+    active stream -- e.g. the user is mid-turn) is retried with a delay;
+    if the session stays busy the failure is returned honestly so
+    last_delivery_error says exactly what happened. Media attachments are
+    not forwarded on this lane (text reports only; the session can read any
+    absolute paths the report references).
+
+    Env knobs: HERMES_CRON_WEBUI_DELIVERY_URL (base URL override),
+    HERMES_CRON_WEBUI_DELIVERY_TIMEOUT (per-request seconds, default 30),
+    HERMES_CRON_WEBUI_BUSY_RETRIES (409 retries after the first attempt,
+    default 6), HERMES_CRON_WEBUI_BUSY_RETRY_DELAY (seconds between
+    retries, default 10).
+    """
+    import urllib.error
+    import urllib.request
+
+    job_id = job.get("id", "?")
+    sid = str(chat_id)
+    base_url = _webui_delivery_base_url()
+    try:
+        timeout = float(os.getenv("HERMES_CRON_WEBUI_DELIVERY_TIMEOUT", "30") or 30)
+    except ValueError:
+        timeout = 30.0
+    try:
+        busy_retries = max(0, int(os.getenv("HERMES_CRON_WEBUI_BUSY_RETRIES", "6") or 6))
+    except ValueError:
+        busy_retries = 6
+    try:
+        busy_delay = float(os.getenv("HERMES_CRON_WEBUI_BUSY_RETRY_DELAY", "10") or 10)
+    except ValueError:
+        busy_delay = 10.0
+
+    auth_headers, auth_err = _webui_login(base_url, timeout)
+    if auth_err:
+        logger.warning("Job '%s': %s", job_id, auth_err)
+        return auth_err
+
+    task_name = job.get("name", job_id)
+    message = (
+        f"[CRON DELIVERY] Scheduled job '{task_name}' ({job_id}) finished - report below.\n\n"
+        f"{content}\n\n"
+        "(Automatic delivery of this cron job's output into the WebUI session "
+        "that created it. Manage the job with cronjob(action='list').)"
+    )
+    body = json.dumps({"session_id": sid, "message": message}).encode("utf-8")
+
+    attempts = busy_retries + 1
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(
+            base_url + "/api/chat/start",
+            data=body,
+            headers=dict(auth_headers),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+            if status == 409 and attempt < attempts:
+                logger.info(
+                    "Job '%s': webui session %s busy (active turn); retry %d/%d in %.0fs",
+                    job_id, sid, attempt, busy_retries, busy_delay,
+                )
+                time.sleep(busy_delay)
+                continue
+            detail = ""
+            try:
+                detail = (e.read() or b"")[:200].decode("utf-8", "replace").strip()
+            except Exception:
+                pass
+            msg = (
+                f"webui delivery to session {sid} failed (HTTP {status}"
+                + (f": {detail}" if detail else "")
+                + ")"
+            )
+            logger.warning("Job '%s': %s", job_id, msg)
+            return msg
+        except Exception as e:
+            msg = f"webui delivery to session {sid} failed: {e or type(e).__name__}"
+            logger.warning("Job '%s': %s", job_id, msg)
+            return msg
+        # 2xx -- the server-side [CRON DELIVERY] turn started in the session.
+        logger.info(
+            "Job '%s': delivered to webui session %s via %s/api/chat/start (attempt %d)",
+            job_id, sid, base_url, attempt,
+        )
+        return None
+    # Defensive: the loop returns on every path.
+    return f"webui delivery to session {sid} failed: session stayed busy"
+
+
 def _normalize_deliver_value(deliver) -> str:
     """Normalize a stored/submitted ``deliver`` value to its canonical string form.
 
@@ -2770,6 +2960,22 @@ _ROUTING_TOKENS = frozenset({"all"})
 # ``all`` routing token: ``all`` fans out to messaging home channels, and a
 # bot-chat delivery costs a full agent turn.
 BOT_CHAT_PLATFORM = "bot-chat"
+
+# t_993b18df: the WebUI pseudo-platform. The Hermes WebUI binds
+# HERMES_SESSION_PLATFORM=webui / HERMES_SESSION_CHAT_ID=<webui session
+# id> for browser chat sessions (api/streaming._build_agent_thread_env),
+# so a deliver=origin job created there carries origin
+# {"platform": "webui", "chat_id": <sid>}. "webui" is not a gateway
+# Platform (no adapter, no credential): like BOT_CHAT_PLATFORM it delivers
+# out-of-band -- see _deliver_to_webui (HTTP POST into the WebUI's own
+# /api/chat/start, which starts a server-side [CRON DELIVERY] agent turn
+# in the exact session that created the job).
+WEBUI_DELIVERY_PLATFORM = "webui"
+
+# WebUI session ids are bare hex strings (12 hex chars today; accept a
+# slightly wider shape so the explicit webui:<session_id> target form
+# keeps working if the id format ever changes).
+_WEBUI_SESSION_ID_RE = re.compile(r"^[0-9a-f]{4,64}$")
 
 
 def parse_bot_chat_deliver_token(part: str) -> Optional[str]:
@@ -3196,6 +3402,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             bot_chat_error = _deliver_to_bot_chat(job, content, chat_id)
             if bot_chat_error:
                 delivery_errors.append(bot_chat_error)
+            continue
+
+        # t_993b18df: WebUI-origin targets (origin.platform == "webui" from
+        # a browser session, or an explicit webui:<session_id>) don't ride a
+        # gateway adapter -- the WebUI is a separate HTTP process. Deliver by
+        # starting a server-side agent turn in the target session. Handled
+        # BEFORE the Platform enum below, which knows nothing about this
+        # pseudo-platform (it used to fail every such target with
+        # "unknown platform 'webui'" and the job's report was lost).
+        if platform_name == WEBUI_DELIVERY_PLATFORM:
+            webui_error = _deliver_to_webui(job, str(chat_id), cleaned_delivery_content)
+            if webui_error:
+                delivery_errors.append(webui_error)
             continue
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
@@ -5115,6 +5334,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
         # local chat subprocess. Unknown-profile failures surface per run in
         # last_delivery_error (and are validated at create time).
         if parse_bot_chat_deliver_token(part) is not None:
+            continue
+        # WebUI delivery is local HTTP to the WebUI's own server (no
+        # gateway credentials) -- same carve-out class as bot-chat
+        # (t_993b18df).
+        if part.split(":", 1)[0].strip().lower() == WEBUI_DELIVERY_PLATFORM:
             continue
         platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
