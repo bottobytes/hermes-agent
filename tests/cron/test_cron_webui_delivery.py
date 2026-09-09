@@ -297,3 +297,273 @@ class TestDeliverResultWebui:
             )
             err = sched._deliver_result(job, "the report")
             assert err is not None and "HTTP 500" in err
+
+
+# --------------------------------------------------------------------------
+# Persistent redelivery for busy sessions (t_ee4b2f97)
+# --------------------------------------------------------------------------
+
+class TestWebuiBusySpool:
+    """Fire-time spooling: a one-shot firing into a busy session must not
+    lose its report — the content is persisted to the spool dir and the job
+    record carries a pending_webui_delivery marker."""
+
+    def _oneshot_job(self):
+        return {
+            "id": "deadbeef1234",
+            "name": "one-shot report",
+            "deliver": "origin",
+            "origin": {"platform": "webui", "chat_id": "90fa91617882"},
+            "schedule": {"kind": "once"},
+            "repeat": {"times": 1, "completed": 1},
+        }
+
+    def test_busy_oneshot_spools_report(self, webui_env, monkeypatch, tmp_path):
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            # Persist the job so the spooler's marker update finds a record.
+            cron_jobs.save_jobs([self._oneshot_job()])
+
+            def busy(j, chat_id, content, **kw):
+                return sched._WebuiBusyError(
+                    f"webui delivery to session {chat_id} failed (HTTP 409) — busy"
+                )
+
+            monkeypatch.setattr(sched, "_deliver_to_webui", busy)
+            err = sched._deliver_result(self._oneshot_job(), "THE LOST REPORT")
+            assert err is not None
+            assert "spooled" in err and "redelivered" in err
+            spools = sched._load_pending_webui_spools()
+            assert len(spools) == 1
+            _path, record = spools[0]
+            assert record["job_id"] == "deadbeef1234"
+            assert record["session_id"] == "90fa91617882"
+            assert "THE LOST REPORT" in record["message"]
+            assert record["attempts"] == 1
+
+    def test_busy_recurring_job_does_not_spool(self, webui_env, monkeypatch, tmp_path):
+        """Recurring jobs self-heal on the next fire — plain honest error,
+        no spool (otherwise every busy recurring fire would double-deliver)."""
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            job = {
+                "id": "rec1",
+                "name": "recurring",
+                "deliver": "origin",
+                "origin": {"platform": "webui", "chat_id": "90fa91617882"},
+                "schedule": {"kind": "interval", "minutes": 5},
+            }
+            cron_jobs.save_jobs([job])
+
+            def busy(j, chat_id, content, **kw):
+                return sched._WebuiBusyError("webui delivery busy")
+
+            monkeypatch.setattr(sched, "_deliver_to_webui", busy)
+            err = sched._deliver_result(job, "recurring report")
+            assert err is not None
+            assert "spooled" not in err
+            assert sched._load_pending_webui_spools() == []
+
+    def test_terminal_error_does_not_spool(self, webui_env, monkeypatch, tmp_path):
+        """404/401/5xx are not busy — no spool, honest error unchanged."""
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([self._oneshot_job()])
+            monkeypatch.setattr(
+                sched, "_deliver_to_webui",
+                lambda j, c, content, **kw: "webui delivery failed (HTTP 500)",
+            )
+            err = sched._deliver_result(self._oneshot_job(), "the report")
+            assert "HTTP 500" in err
+            assert sched._load_pending_webui_spools() == []
+
+    def test_busy_marker_is_str_and_busy(self):
+        sentinel = sched._WebuiBusyError("busy (HTTP 409)")
+        assert isinstance(sentinel, str)
+        assert sentinel.busy is True
+        assert "HTTP 409" in sentinel
+
+
+class TestWebuiRedeliveryPass:
+    """Tick-time redelivery over the spool: busy→idle delivers, persistent
+    busy backs off, horizon gives up honestly, terminal errors park."""
+
+    def _spool(self, tmp_path, cron_jobs, **overrides):
+        from datetime import datetime, timezone
+
+        record = {
+            "job_id": "aaa111bbb222",
+            "name": "spooled job",
+            "session_id": "90fa91617882",
+            "message": "DEFERRED REPORT",
+            # Fresh by default: inside the redelivery horizon. Tests that
+            # need staleness override first_try/last_try explicitly.
+            "first_try": datetime.now(timezone.utc).isoformat(),
+            "attempts": 1,
+            "error": "busy",
+        }
+        record.update(overrides)
+        base = sched._webui_pending_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "aaa111bbb222__90fa91617882__20260909T140000.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        return path, record
+
+    def test_idle_session_redelivers_and_cleans_up(
+        self, webui_env, monkeypatch, tmp_path
+    ):
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            job = {
+                "id": "aaa111bbb222",
+                "name": "spooled job",
+                "schedule": {"kind": "once"},
+                "repeat": {"times": 1, "completed": 1},
+                "state": "completed",
+                "enabled": False,
+                "last_delivery_error": "old busy error",
+            }
+            cron_jobs.save_jobs([job])
+            path, _ = self._spool(tmp_path, cron_jobs)
+
+            delivered = {}
+            monkeypatch.setattr(
+                sched, "_deliver_to_webui",
+                lambda j, sid, content, **kw: delivered.update(
+                    sid=sid, content=content
+                ) or None,
+            )
+            n = sched._deliver_pending_webui_reports()
+            assert n == 1
+            assert delivered["sid"] == "90fa91617882"
+            assert "DEFERRED REPORT" in delivered["content"]
+            assert not path.exists()
+            jobs_after = cron_jobs.load_jobs()
+            assert jobs_after[0].get("pending_webui_delivery") in (None,)
+            assert jobs_after[0].get("last_delivery_error") is None
+
+    def test_still_busy_backs_off_without_giving_up(
+        self, webui_env, monkeypatch, tmp_path
+    ):
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            path, _ = self._spool(tmp_path, cron_jobs)
+
+            def busy(j, sid, content, **kw):
+                return sched._WebuiBusyError("still busy (HTTP 409)")
+
+            monkeypatch.setattr(sched, "_deliver_to_webui", busy)
+            n = sched._deliver_pending_webui_reports()
+            assert n == 0
+            # Spool still there, attempts bumped, last_try recorded.
+            spools = sched._load_pending_webui_spools()
+            assert len(spools) == 1
+            _p, record = spools[0]
+            assert record["attempts"] == 2
+            assert record.get("last_try")
+
+    def test_horizon_gives_up_preserving_content(
+        self, webui_env, monkeypatch, tmp_path
+    ):
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            job = {
+                "id": "aaa111bbb222",
+                "name": "spooled job",
+                "schedule": {"kind": "once"},
+                "state": "completed",
+                "enabled": False,
+            }
+            cron_jobs.save_jobs([job])
+            # first_try two hours ago — past the 1h default horizon.
+            self._spool(
+                tmp_path, cron_jobs,
+                first_try="2026-09-09T12:00:00+00:00",
+                last_try="2026-09-09T13:59:00+00:00",
+            )
+
+            def busy(j, sid, content, **kw):
+                return sched._WebuiBusyError("busy")
+
+            monkeypatch.setattr(sched, "_deliver_to_webui", busy)
+            n = sched._deliver_pending_webui_reports()
+            assert n == 0
+            assert sched._load_pending_webui_spools() == []
+            gaveup = list(sched._webui_pending_dir().glob("*.gaveup*"))
+            assert len(gaveup) == 1
+            jobs_after = cron_jobs.load_jobs()
+            err = jobs_after[0].get("last_delivery_error") or ""
+            assert "abandoned" in err and "gaveup" in jobs_after[0]["last_delivery_error"]
+
+    def test_terminal_error_parks_with_content(
+        self, webui_env, monkeypatch, tmp_path
+    ):
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            job = {
+                "id": "aaa111bbb222",
+                "name": "spooled job",
+                "schedule": {"kind": "once"},
+                "state": "completed",
+                "enabled": False,
+            }
+            cron_jobs.save_jobs([job])
+            self._spool(tmp_path, cron_jobs)
+
+            monkeypatch.setattr(
+                sched, "_deliver_to_webui",
+                lambda j, sid, content, **kw: "webui delivery failed (HTTP 404)",
+            )
+            n = sched._deliver_pending_webui_reports()
+            assert n == 0
+            assert sched._load_pending_webui_spools() == []
+            assert list(sched._webui_pending_dir().glob("*.gaveup*"))
+            jobs_after = cron_jobs.load_jobs()
+            assert "HTTP 404" in (jobs_after[0].get("last_delivery_error") or "")
+
+    def test_backoff_window_respected(self, webui_env, monkeypatch, tmp_path):
+        """A spool poked seconds ago must not be re-poked immediately."""
+        from cron import jobs as cron_jobs
+        from datetime import datetime, timezone
+
+        with cron_jobs.use_cron_store(tmp_path):
+            now_iso = datetime.now(timezone.utc).isoformat()
+            self._spool(
+                tmp_path, cron_jobs,
+                first_try=now_iso, last_try=now_iso, attempts=3,
+            )
+            calls = []
+            monkeypatch.setattr(
+                sched, "_deliver_to_webui",
+                lambda j, sid, content, **kw: calls.append(sid) or None,
+            )
+            n = sched._deliver_pending_webui_reports()
+            assert n == 0
+            assert calls == []  # backoff (30s * 2^2 = 120s) not elapsed
+
+
+class TestTickRunsRedelivery:
+    def test_idle_tick_still_runs_redelivery_pass(self, webui_env, monkeypatch, tmp_path):
+        """The redelivery hook must run on IDLE ticks too — that's when the
+        operator has stopped typing and the session goes idle."""
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            calls = []
+            monkeypatch.setattr(
+                sched, "_deliver_pending_webui_reports",
+                lambda: calls.append(1) or 0,
+            )
+            monkeypatch.setattr(
+                sched, "get_due_jobs", lambda: [],
+            )
+            n = sched.tick(verbose=False, sync=True)
+            assert n == 0
+            assert calls == [1]

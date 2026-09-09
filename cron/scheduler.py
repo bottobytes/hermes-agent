@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -2819,7 +2819,42 @@ def _webui_login(base_url: str, timeout: float) -> tuple:
     return out, None
 
 
-def _deliver_to_webui(job: dict, chat_id: str, content: str) -> Optional[str]:
+class _WebuiBusyError(str):
+    """Busy-sentinel string (t_ee4b2f97).
+
+    A plain ``str`` for every existing caller — equality, logging, slicing,
+    ``last_delivery_error`` all behave identically — but isinstance-
+    detectable so ``_deliver_result``'s webui branch can spool the report
+    for persistent redelivery, and the tick-time redelivery loop can tell
+    "session busy again" (retry later) from terminal HTTP failures (404/401/
+    5xx — redelivery cannot fix those).
+    """
+
+    __slots__ = ()
+
+    @property
+    def busy(self) -> bool:
+        return True
+
+
+def _webui_busy_retries_env() -> int:
+    try:
+        return max(0, int(os.getenv("HERMES_CRON_WEBUI_BUSY_RETRIES", "6") or 6))
+    except ValueError:
+        return 6
+
+
+def _webui_busy_delay_env() -> float:
+    try:
+        return float(os.getenv("HERMES_CRON_WEBUI_BUSY_RETRY_DELAY", "10") or 10)
+    except ValueError:
+        return 10.0
+
+
+def _deliver_to_webui(
+    job: dict, chat_id: str, content: str, *, busy_retries: Optional[int] = None,
+    timeout: Optional[float] = None,
+) -> Optional[str]:
     """Deliver a cron report into a WebUI chat session (t_993b18df).
 
     ``webui`` targets are Hermes WebUI browser sessions: the WebUI stamps
@@ -2853,18 +2888,16 @@ def _deliver_to_webui(job: dict, chat_id: str, content: str) -> Optional[str]:
     job_id = job.get("id", "?")
     sid = str(chat_id)
     base_url = _webui_delivery_base_url()
-    try:
-        timeout = float(os.getenv("HERMES_CRON_WEBUI_DELIVERY_TIMEOUT", "30") or 30)
-    except ValueError:
-        timeout = 30.0
-    try:
-        busy_retries = max(0, int(os.getenv("HERMES_CRON_WEBUI_BUSY_RETRIES", "6") or 6))
-    except ValueError:
-        busy_retries = 6
-    try:
-        busy_delay = float(os.getenv("HERMES_CRON_WEBUI_BUSY_RETRY_DELAY", "10") or 10)
-    except ValueError:
-        busy_delay = 10.0
+    if timeout is None:
+        try:
+            timeout = float(os.getenv("HERMES_CRON_WEBUI_DELIVERY_TIMEOUT", "30") or 30)
+        except ValueError:
+            timeout = 30.0
+    if busy_retries is None:
+        busy_retries = _webui_busy_retries_env()
+    else:
+        busy_retries = max(0, int(busy_retries))
+    busy_delay = _webui_busy_delay_env()
 
     auth_headers, auth_err = _webui_login(base_url, timeout)
     if auth_err:
@@ -2905,6 +2938,22 @@ def _deliver_to_webui(job: dict, chat_id: str, content: str) -> Optional[str]:
                 detail = (e.read() or b"")[:200].decode("utf-8", "replace").strip()
             except Exception:
                 pass
+            if status == 409:
+                # Busy-exhaust is the ONE failure a LATER tick can fix (the
+                # user finishes their turn): return the sentinel so the
+                # caller can spool for redelivery (t_ee4b2f97), while the
+                # string itself stays the honest last_delivery_error.
+                logger.warning(
+                    "Job '%s': webui session %s stayed busy through %d attempt(s); "
+                    "scheduling persistent redelivery",
+                    job_id, sid, attempt,
+                )
+                return _WebuiBusyError(
+                    f"webui delivery to session {sid} failed (HTTP 409"
+                    + (f": {detail}" if detail else "")
+                    + ") — session busy (active turn); persistent redelivery "
+                    "scheduled"
+                )
             msg = (
                 f"webui delivery to session {sid} failed (HTTP {status}"
                 + (f": {detail}" if detail else "")
@@ -2922,8 +2971,318 @@ def _deliver_to_webui(job: dict, chat_id: str, content: str) -> Optional[str]:
             job_id, sid, base_url, attempt,
         )
         return None
-    # Defensive: the loop returns on every path.
-    return f"webui delivery to session {sid} failed: session stayed busy"
+    # Defensive: the loop returns on every path. A fall-through here means
+    # every attempt hit the 409-retry branch — the busy sentinel.
+    return _WebuiBusyError(
+        f"webui delivery to session {sid} failed: session stayed busy "
+        "(active turn) through all in-fire retries"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Persistent webui redelivery spool (t_ee4b2f97)
+#
+# A one-shot cron firing while the target WebUI session is mid-turn loses its
+# report for good once the in-fire 409 retries exhaust: the job has already
+# consumed its single run. Recurring jobs self-heal on the next fire; one-shots
+# do not. Instead of losing the report, spool it to disk and let every tick
+# re-attempt delivery until the session goes idle (bounded by
+# HERMES_CRON_WEBUI_REDELIVER_HORIZON, default 3600s). The spool is plain JSON
+# on the same filesystem as jobs.json, so redelivery survives gateway restarts.
+# ---------------------------------------------------------------------------
+
+_WEBUI_PENDING_DIR = "webui_pending"
+
+
+def _set_pending_webui_marker(job_id: str, marker) -> None:
+    """Best-effort set/clear of the pending_webui_delivery marker on a job.
+
+    Deliberately NOT update_job(): at fire time _deliver_result runs BEFORE
+    mark_job_run, so the record still carries enabled=True/state="scheduled"
+    with no next_run_at — update_job's reschedule guard then rejects the
+    write ("one-shot time ... in the past") for exactly the jobs this
+    marker describes. The marker is cosmetic (cronjob list visibility); the
+    spool file is the actual redelivery state. Never raises.
+    """
+    try:
+        from cron.jobs import _jobs_lock, load_jobs, save_jobs
+
+        with _jobs_lock():
+            jobs = load_jobs()
+            for i, job in enumerate(jobs):
+                if job.get("id") != job_id:
+                    continue
+                if marker is None:
+                    job.pop("pending_webui_delivery", None)
+                else:
+                    job["pending_webui_delivery"] = marker
+                jobs[i] = job
+                save_jobs(jobs)
+                return
+    except Exception:
+        pass
+
+
+def _webui_redeliver_horizon_seconds() -> float:
+    try:
+        return float(
+            os.getenv("HERMES_CRON_WEBUI_REDELIVER_HORIZON", "3600") or 3600
+        )
+    except ValueError:
+        return 3600.0
+
+
+def _webui_pending_dir() -> Path:
+    from cron.jobs import get_cron_output_dir
+
+    return get_cron_output_dir().parent / _WEBUI_PENDING_DIR
+
+
+_WEBUI_SPOOL_RE = re.compile(
+    r"^(?P<job>[0-9a-zA-Z_-]+)__(?P<sid>[0-9a-zA-Z_-]+)__(?P<ts>\d{8}T\d{6})\.json$"
+)
+
+
+def _spool_pending_webui_delivery(job: dict, chat_id: str, content: str, error: str) -> Optional[str]:
+    """Persist a busy-failed webui report for redelivery on later ticks.
+
+    Returns a description of the spool location on success (the caller folds
+    it into the delivery error surfaced via ``last_delivery_error`` so the
+    honest-reporting contract keeps holding), or None if spooling itself
+    failed (the original busy error is then kept by the caller).
+    """
+    job_id = str(job.get("id") or "?")
+    sid = str(chat_id)
+    from cron.jobs import _hermes_now as _jobs_now  # type: ignore[attr-defined]
+    now = _jobs_now()
+    try:
+        base = _webui_pending_dir()
+        base.mkdir(parents=True, exist_ok=True)
+        ts = now.strftime("%Y%m%dT%H%M%S")
+        record = {
+            "job_id": job_id,
+            "name": job.get("name"),
+            "session_id": sid,
+            "message": content,
+            "first_try": now.isoformat(),
+            "attempts": 1,
+            "error": error,
+        }
+        # Deterministic base name: job__sid__timestamp.json. A same-second
+        # collision (two fires of the same job into the same session) gets
+        # a numeric suffix rather than a clobber.
+        fname = f"{job_id}__{sid}__{ts}.json"
+        fpath = base / fname
+        n = 1
+        while fpath.exists():
+            n += 1
+            fpath = base / f"{job_id}__{sid}__{ts}_{n}.json"
+        fpath.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding="utf-8")
+        # Best-effort marker on the job record — lets `cronjob list` show
+        # "pending redelivery" even before the next tick. Never fatal.
+        _set_pending_webui_marker(job_id, {
+            "session_id": sid,
+            "spool_file": fpath.name,
+            "first_try": record["first_try"],
+            "attempts": 1,
+        })
+        logger.warning(
+            "Job '%s': webui session %s busy — report spooled for redelivery "
+            "(%s; horizon %.0fs)",
+            job_id, sid, fpath.name, _webui_redeliver_horizon_seconds(),
+        )
+        return (
+            f"webui delivery to session {sid} deferred: session busy; report "
+            f"spooled as {fpath.name} and will be redelivered when the session "
+            "goes idle"
+        )
+    except Exception as e:
+        logger.error("Job '%s': failed to spool webui redelivery: %s", job_id, e)
+        return None
+
+
+def _load_pending_webui_spools() -> list:
+    """Return (path, record) pairs for every valid pending webui spool file.
+
+    Robust to foreign/malformed files (skips them) and to the directory not
+    existing (idle system).
+    """
+    out = []
+    try:
+        base = _webui_pending_dir()
+        if not base.is_dir():
+            return out
+        for entry in sorted(base.iterdir()):
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                if not _WEBUI_SPOOL_RE.match(entry.name):
+                    continue
+                record = json.loads(entry.read_text(encoding="utf-8"))
+                if not isinstance(record, dict):
+                    continue
+                if not record.get("session_id") or not record.get("message"):
+                    continue
+                out.append((entry, record))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _parse_spool_time(value) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _webui_redelivery_backoff_seconds(attempts: int) -> float:
+    """Exponential backoff between spool redelivery attempts: 30s doubling to
+    a 5-minute ceiling. Cheap single HTTP attempts, so the curve stays flat
+    compared to the in-fire block."""
+    return min(300.0, 30.0 * (2 ** max(0, attempts - 1)))
+
+
+def _deliver_pending_webui_reports() -> int:
+    """One redelivery pass over the pending-webui spool; called from tick().
+
+    For each spool whose backoff window has elapsed: re-attempt delivery
+    (single in-fire attempt — the point is to probe idleness cheaply); on
+    success drop the spool + clear the job marker; on renewed 409 bump the
+    attempt count and update next-try; past the horizon, give up honestly
+    (rename to .gaveup, keep content, surface in last_delivery_error).
+
+    Never raises: a broken spool directory must not take the ticker down.
+    Returns the number of reports successfully redelivered.
+    """
+    delivered = 0
+    try:
+        horizon = _webui_redeliver_horizon_seconds()
+        now = datetime.now(timezone.utc)
+        for path, record in _load_pending_webui_spools():
+            try:
+                job_id = str(record.get("job_id") or "?")
+                sid = str(record.get("session_id"))
+                attempts = int(record.get("attempts") or 0) + 1
+                first_try = _parse_spool_time(record.get("first_try"))
+                last_try = _parse_spool_time(record.get("last_try"))
+                # Due for another poke? The anchor is the LAST redelivery
+                # poke (last_try). A fresh spool has none — the in-fire
+                # retry block JUST ended, so the next tick pokes once
+                # immediately, and backoff chains from each poke after that.
+                anchor = last_try
+                if anchor is not None:
+                    due_at = anchor + timedelta(
+                        seconds=_webui_redelivery_backoff_seconds(attempts)
+                    )
+                    if now < due_at:
+                        continue
+                # Horizon check: give up honestly, keep the content on disk.
+                if first_try is not None and (now - first_try).total_seconds() > horizon:
+                    gaveup = path.with_suffix(".gaveup")
+                    try:
+                        n = 1
+                        while gaveup.exists():
+                            n += 1
+                            gaveup = path.with_name(
+                                path.stem + f".gaveup.{n}" + path.suffix
+                            )
+                        path.rename(gaveup)
+                    except Exception:
+                        gaveup = path
+                    _set_pending_webui_marker(job_id, None)
+                    try:
+                        from cron.jobs import update_job
+                        update_job(job_id, {
+                            "last_delivery_error": (
+                                f"webui delivery to session {sid} abandoned: "
+                                f"session stayed busy for over {int(horizon)}s "
+                                f"(report preserved at {gaveup.name})"
+                            ),
+                        })
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Job '%s': webui redelivery to session %s gave up after "
+                        "%.0fs busy; report preserved at %s",
+                        job_id, sid, horizon, gaveup.name,
+                    )
+                    continue
+                # Single cheap probe: one POST, no in-fire retry loop. Bounded
+                # timeout (10s) so a wedged WebUI can't stall the tick thread.
+                job_stub = {"id": job_id, "name": record.get("name") or job_id}
+                err = _deliver_to_webui(
+                    job_stub, sid, record.get("message") or "",
+                    busy_retries=0, timeout=10.0,
+                )
+                if err is None:
+                    delivered += 1
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    _set_pending_webui_marker(job_id, None)
+                    try:
+                        from cron.jobs import update_job
+                        update_job(job_id, {"last_delivery_error": None})
+                    except Exception:
+                        pass
+                    logger.info(
+                        "Job '%s': deferred webui report redelivered to session "
+                        "%s (attempt %d)",
+                        job_id, sid, attempts,
+                    )
+                elif isinstance(err, _WebuiBusyError):
+                    record["attempts"] = attempts
+                    record["last_try"] = now.isoformat()
+                    record["error"] = str(err)
+                    try:
+                        path.write_text(
+                            json.dumps(record, ensure_ascii=False, indent=1),
+                            encoding="utf-8",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Non-busy terminal errors (404 session gone, 401, 5xx):
+                    # redelivery cannot fix them; keep the content on disk
+                    # and surface honestly.
+                    gaveup = path.with_suffix(".gaveup")
+                    try:
+                        n = 1
+                        while gaveup.exists():
+                            n += 1
+                            gaveup = path.with_name(
+                                path.stem + f".gaveup.{n}" + path.suffix
+                            )
+                        path.rename(gaveup)
+                    except Exception:
+                        gaveup = path
+                    _set_pending_webui_marker(job_id, None)
+                    try:
+                        from cron.jobs import update_job
+                        update_job(job_id, {
+                            "last_delivery_error": f"{err} (report preserved at {gaveup.name})",
+                        })
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "Job '%s': webui redelivery to session %s failed "
+                        "terminally: %s (report preserved at %s)",
+                        job_id, sid, err, gaveup.name,
+                    )
+            except Exception:
+                logger.debug("Pending webui spool %s processing failed", path, exc_info=True)
+    except Exception:
+        logger.debug("Pending webui redelivery pass failed", exc_info=True)
+    return delivered
 
 
 def _normalize_deliver_value(deliver) -> str:
@@ -3413,6 +3772,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # "unknown platform 'webui'" and the job's report was lost).
         if platform_name == WEBUI_DELIVERY_PLATFORM:
             webui_error = _deliver_to_webui(job, str(chat_id), cleaned_delivery_content)
+            if isinstance(webui_error, _WebuiBusyError):
+                # t_ee4b2f97: the target session stayed busy through every
+                # in-fire retry. For a one-shot (schedule.kind == "once" or
+                # repeat.times == 1) the report would be LOST once this fire
+                # ends — the job is terminal and will never fire again. Spool
+                # the report and let every subsequent tick redeliver it when
+                # the session goes idle. Recurring jobs still self-heal on
+                # their next fire, so they keep the honest plain error.
+                _is_oneshot = False
+                _sched = job.get("schedule") or {}
+                _rep = job.get("repeat") or {}
+                if _sched.get("kind") == "once" or _rep.get("times") == 1:
+                    _is_oneshot = True
+                if _is_oneshot:
+                    spooled = _spool_pending_webui_delivery(
+                        job, str(chat_id), cleaned_delivery_content, webui_error
+                    )
+                    if spooled:
+                        webui_error = spooled
             if webui_error:
                 delivery_errors.append(webui_error)
             continue
@@ -7976,6 +8354,20 @@ def tick(
                 sweep_stale_inflight(_sweep_jobs)
             except Exception as e:
                 logger.warning("Stale in-flight sweep failed: %s", e)
+
+        # t_ee4b2f97: redeliver spooled webui reports (busy-session defers)
+        # on EVERY tick — including idle ticks, which is exactly when the
+        # operator has stopped typing and the session has gone idle. Never
+        # raises; broken spool state must not take the ticker down.
+        try:
+            _redelivered = _deliver_pending_webui_reports()
+            if _redelivered and verbose:
+                logger.info(
+                    "%s - redelivered %d deferred webui report(s)",
+                    _hermes_now().strftime('%H:%M:%S'), _redelivered,
+                )
+        except Exception as _e:
+            logger.debug("Pending webui redelivery pass failed: %s", _e)
 
         if not due_jobs:
             # Idle tick: skip config load + pool partitioning entirely
