@@ -342,6 +342,7 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.skipped_review_lane_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -10191,6 +10192,16 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_review_lane_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Review cards deferred this tick because their assignee is already
+    at the review-LANE cap (t_a0d28a97: ``kanban.review_lane_max_parallel``
+    or ``kanban.review_lane_max_parallel_map``). Each entry is
+    ``(task_id, assignee, current_review_lane_count)``. Same clean-skip
+    semantics as ``skipped_per_profile_capped`` — no events, no failure
+    ticks, no guard: the card stays review-queued with clean fields until
+    the assignee's surviving review lane finishes, exactly the visual of
+    a full lane (the review-spawn-starvation detector remains the
+    observability net for a lane that NEVER drains)."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -13180,6 +13191,112 @@ def per_profile_cap_map() -> dict:
     return out
 
 
+def review_lane_max_parallel() -> Optional[int]:
+    """Scalar per-profile review-lane concurrency cap (t_a0d28a97).
+
+    The Captain's 2026-09-09 12:25Z ruling — a reviewer profile on a
+    shared model pool must stay SERIAL (parallel heavy review workers
+    burn the pool and cause fleet-wide rate-limit walls). The dispatcher
+    historically had no lane-specific cap: every claimable review card
+    got its own worker (four simultaneous review lanes on 2026-09-09),
+    bounded only by the TOTAL per-profile cap
+    (``max_in_progress_per_profile_map``), which is sized for
+    implementation fan-out, not for serialized review traffic.
+
+    Resolution mirrors ``_resolve_review_spawn_starved_seconds``:
+    ``HERMES_KANBAN_REVIEW_LANE_MAX_PARALLEL`` env (int >= 1) wins, then
+    ``kanban.review_lane_max_parallel`` from the ROOT config, then
+    ``None`` — no review-lane cap, the pre-t_a0d28a97 behaviour. Per
+    profile, ``kanban.review_lane_max_parallel_map`` (see
+    :func:`review_lane_cap_map`) overrides this scalar. Invalid /
+    non-positive values fall through to the next source silently.
+    """
+    raw_env = os.environ.get(
+        "HERMES_KANBAN_REVIEW_LANE_MAX_PARALLEL", ""
+    ).strip()
+    if raw_env:
+        try:
+            parsed = int(raw_env)
+        except ValueError:
+            parsed = -1
+        if parsed >= 1:
+            return parsed
+    raw = _load_root_kanban_cfg().get("review_lane_max_parallel")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
+def review_lane_cap_map() -> dict:
+    """Per-profile review-lane cap overrides (t_a0d28a97).
+
+    ``kanban.review_lane_max_parallel_map`` — mapping of profile name to
+    the per-profile cap on concurrent REVIEW-origin workers that wins
+    over the scalar ``kanban.review_lane_max_parallel`` for that profile
+    (e.g. ``sportacus-reviewer: 1`` encodes the serial-reviewer ruling
+    without constraining other profiles' review lanes). Same
+    normalization/fail-open contract as :func:`per_profile_cap_map`:
+    keys stripped + lowercased, invalid entries (non-int, < 1, booleans)
+    dropped, non-dict value yields ``{}``.
+    """
+    raw = _load_root_kanban_cfg().get("review_lane_max_parallel_map")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for pname, pcap in raw.items():
+        if isinstance(pcap, bool) or not isinstance(pcap, int) or pcap < 1:
+            continue
+        key = str(pname or "").strip().lower()
+        if key:
+            out[key] = pcap
+    return out
+
+
+def count_running_review_origin_per_profile(
+    conn: sqlite3.Connection,
+) -> dict:
+    """Count in-flight REVIEW-origin runs per assignee (t_a0d28a97).
+
+    A review run is identified by its claim provenance — the
+    ``source_status=review`` marker :func:`claim_review_task` records on
+    the ``claimed`` event (the same marker ``_retry_status_for_run``
+    uses), joined through ``tasks.current_run_id`` so only the CURRENT
+    run of each ``running`` task counts. Implementation runs under the
+    same profile are invisible here by design: the review-lane cap must
+    not be consumed by non-review work (and vice versa — the TOTAL
+    per-profile cap still sees both).
+
+    Fails open to ``{}`` (no review lanes counted → lane can spawn): a
+    broken event payload or a legacy row without ``current_run_id`` is
+    never a reason to starve the review lane.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT t.assignee AS assignee, e.payload AS payload "
+            "FROM tasks t JOIN task_events e "
+            "  ON e.task_id = t.id AND e.run_id = t.current_run_id "
+            " AND e.kind = 'claimed' "
+            "WHERE t.status = 'running' AND t.current_run_id IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    counts: dict = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("source_status") != "review":
+            continue
+        assignee = str(row["assignee"] or "").strip()
+        if not assignee:
+            continue
+        counts[assignee] = counts.get(assignee, 0) + 1
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
@@ -13762,6 +13879,38 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Review-lane cap scaffolding (t_a0d28a97): resolve the scalar cap and
+    # per-profile overrides once per tick, and count in-flight
+    # REVIEW-origin runs per assignee. Counter keys are the RAW assignee
+    # strings (matching task rows), while cap lookups normalize — same
+    # convention as the total per-profile cap above.
+    _review_lane_scalar = review_lane_max_parallel()
+    _review_lane_caps: dict = {}
+    try:
+        _review_lane_caps = dict(review_lane_cap_map())
+    except Exception:
+        _review_lane_caps = {}
+    _any_review_lane_cap = (
+        _review_lane_scalar is not None or bool(_review_lane_caps)
+    )
+
+    def _review_lane_cap_for(assignee: Optional[str]) -> Optional[int]:
+        """Effective review-lane cap for one assignee (map > scalar > None)."""
+        if not assignee:
+            return None
+        mapped = _review_lane_caps.get(str(assignee).strip().lower())
+        if isinstance(mapped, int) and mapped > 0:
+            return mapped
+        return _review_lane_scalar
+
+    _review_lane_running: dict[str, int] = {}
+    if _any_review_lane_cap:
+        try:
+            _review_lane_running = count_running_review_origin_per_profile(
+                conn
+            )
+        except Exception:
+            _review_lane_running = {}
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -13998,6 +14147,25 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Review-LANE concurrency cap (t_a0d28a97, Captain ruling 12:25Z):
+        # bound how many REVIEW-origin workers one profile may have in
+        # flight, independently of the total per-profile cap. The Sep-9
+        # incident: 4 simultaneous review lanes under sportacus-reviewer
+        # (total cap 4) burned the shared zai pool and caused the
+        # 14:2xZ burst rate-limit wall. A profile at its review-lane cap
+        # simply doesn't claim more review cards — clean skip, no events,
+        # no failure ticks, no guard (identical semantics to a capped
+        # ready card; the review-spawn-starvation detector stays the net
+        # for a lane that never drains). Only the review loop consults
+        # this cap: ready-lane work under the same profile is untouched.
+        _review_lane_cap = _review_lane_cap_for(row["assignee"])
+        if _review_lane_cap is not None:
+            _rl_current = _review_lane_running.get(row["assignee"], 0)
+            if _rl_current >= _review_lane_cap:
+                result.skipped_review_lane_capped.append(
+                    (row["id"], row["assignee"], _rl_current)
+                )
+                continue
         _review_cap = _cap_for(row["assignee"])
         if _review_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -14022,6 +14190,12 @@ def _dispatch_once_locked(
             if _any_profile_cap:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
+                )
+            # t_a0d28a97: the dry-run path must respect the review-lane
+            # cap too, or dry runs over-report spawnable reviews.
+            if _any_review_lane_cap:
+                _review_lane_running[row["assignee"]] = (
+                    _review_lane_running.get(row["assignee"], 0) + 1
                 )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -14074,6 +14248,13 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            # t_a0d28a97: track the new review lane for this profile so
+            # later iterations in this same tick respect the review-lane
+            # cap (same tick-local accounting as the total cap).
+            if _any_review_lane_cap and claimed.assignee:
+                _review_lane_running[claimed.assignee] = (
+                    _review_lane_running.get(claimed.assignee, 0) + 1
+                )
             if _any_profile_cap and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1

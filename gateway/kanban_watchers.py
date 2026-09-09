@@ -1708,6 +1708,22 @@ class GatewayKanbanWatchersMixin:
                 "(per-profile overrides of the scalar cap)",
                 _cap_map,
             )
+        # t_a0d28a97: log the review-lane cap set (read inside each dispatch
+        # tick; logged here once at startup as restart-verification
+        # evidence). Fail-open: unreadable config = no review-lane cap.
+        try:
+            _rl_scalar = _kb.review_lane_max_parallel()
+            _rl_map = dict(_kb.review_lane_cap_map())
+        except Exception:
+            _rl_scalar, _rl_map = None, {}
+        if _rl_scalar is not None or _rl_map:
+            logger.info(
+                "kanban dispatcher: review_lane_max_parallel=%r "
+                "review_lane_max_parallel_map=%s (t_a0d28a97 serial-review "
+                "lane cap; counts only review-origin runs)",
+                _rl_scalar,
+                _rl_map,
+            )
         try:
             _default_reviewer = _kb.default_reviewer_profile()
         except Exception:
