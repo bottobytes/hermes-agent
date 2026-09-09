@@ -12695,6 +12695,28 @@ def _root_kanban_cfg_candidates() -> list:
     real_home = os.environ.get("HERMES_REAL_HOME", "").strip()
     if real_home:
         candidates.append(("real_home", Path(real_home) / ".hermes" / "config.yaml"))
+    # t_d3f69e96: profile-mode derivation. A worker (or any hand-launched
+    # ``hermes -p <profile>`` session) runs with HERMES_HOME=<root>/profiles/
+    # <name> and, before the spawn-side fix, no HERMES_REAL_HOME at all —
+    # candidates used to fall straight to get_config_path(), i.e. the
+    # PROFILE's own (knob-less) config, and the root kanban block was
+    # silently invisible (live: review auto-route dead for worker-originated
+    # requests, Sep 9). ``get_default_hermes_root()`` is the kernel's own
+    # profile-aware root resolver (it maps <root>/profiles/<name> back to
+    # <root>); only a candidate that DIFFERS from the active home is worth
+    # trying, so vanilla installs (root == active home) are unchanged.
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        _derived_root = str(get_default_hermes_root()).strip()
+        _active_home = os.environ.get("HERMES_HOME", "").strip()
+        if _derived_root and _derived_root != _active_home:
+            # NB: get_default_hermes_root() already returns the .hermes root
+            # (~/.hermes), unlike HERMES_REAL_HOME which is the OS home —
+            # the config sits directly inside it.
+            candidates.append(("derived_root", Path(_derived_root) / "config.yaml"))
+    except Exception:
+        pass
     try:
         from hermes_cli.config import get_config_path
 
@@ -14025,6 +14047,28 @@ def _default_spawn(
         # _apply_profile_override() via HERMES_PROFILE (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
+        pass
+    # t_d3f69e96: pin HERMES_REAL_HOME into the worker env. The kernel's
+    # root-kanban-config contract (see _root_kanban_cfg_candidates) expects
+    # dispatcher-spawned workers to carry it, but this spawn path never set
+    # it — workers resolved the PROFILE config as "root" and the root
+    # ``kanban:`` block (default_reviewer, per-profile cap map) was silently
+    # invisible to every worker-originated kanban_request_review (live
+    # Sep 9: review auto-route dead, starved reviews on t_f0e998f6 /
+    # t_456600d2). ``get_real_home`` is the same resolver the terminal
+    # subprocess sanitizer uses (hermes_constants.apply_subprocess_home_env
+    # sets exactly this var); it prefers an explicit HERMES_REAL_HOME, then
+    # HOME, then the passwd entry — on the dispatcher it yields the OS user
+    # home, the directory that CONTAINS .hermes/config.yaml with the knobs.
+    # Belt: never overwrite an inherited HERMES_REAL_HOME (operator/test
+    # override) and never touch HOME itself — this pin is additive.
+    try:
+        from hermes_constants import get_real_home as _get_real_home
+
+        _real_home = str(_get_real_home(env)).strip()
+        if _real_home and "HERMES_REAL_HOME" not in env:
+            env["HERMES_REAL_HOME"] = _real_home
+    except Exception:
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
