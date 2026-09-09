@@ -213,6 +213,33 @@ class TestDeliverToWebui:
         err = sched._deliver_to_webui(self._job(), "sid", "body")
         assert err is not None and "HTTP 409" in err
 
+    def test_busy_409_exhaust_makes_no_scheduling_claim(self, webui_env, monkeypatch, caplog):
+        """t_70dd9cc7: _deliver_to_webui cannot know whether the caller will
+        spool (one-shot) or not (recurring) — so neither its WARNING nor the
+        sentinel string may claim a redelivery was scheduled. The claim lives
+        exclusively on the spool path (_spool_pending_webui_delivery)."""
+        monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+
+        def busy(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 409, "Conflict", {}, None  # type: ignore[arg-type]
+            )
+
+        spy = _URLOpenSpy([_login_resp, busy, busy, busy])
+        monkeypatch.setattr("urllib.request.urlopen", spy)
+        with caplog.at_level("INFO", logger="cron.scheduler"):
+            err = sched._deliver_to_webui(self._job(), "sid", "body")
+        assert isinstance(err, sched._WebuiBusyError)
+        # Honest busy error, no scheduling promise…
+        assert "HTTP 409" in err and "session busy" in err
+        assert "persistent redelivery" not in err
+        assert "scheduled" not in err
+        # …and the log says the session stayed busy WITHOUT claiming a
+        # redelivery was queued.
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("stayed busy through" in m for m in msgs)
+        assert not any("scheduling persistent redelivery" in m for m in msgs)
+
     def test_404_surfaces_immediately(self, webui_env, monkeypatch):
 
         def gone(req, timeout=None):
@@ -365,6 +392,47 @@ class TestWebuiBusySpool:
             assert err is not None
             assert "spooled" not in err
             assert sched._load_pending_webui_spools() == []
+
+    def test_busy_recurring_job_does_not_log_redelivery_scheduling(
+        self, webui_env, monkeypatch, tmp_path, caplog
+    ):
+        """t_70dd9cc7: the recurring busy-exhaust path must not log any claim
+        that a redelivery was scheduled — nothing is (the job self-heals on
+        its next fire). One-shots DO get the claim, via the spool WARNING."""
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            job = {
+                "id": "rec2",
+                "name": "recurring ctrl",
+                "deliver": "origin",
+                "origin": {"platform": "webui", "chat_id": "90fa91617882"},
+                "schedule": {"kind": "interval", "minutes": 3},
+            }
+            cron_jobs.save_jobs([job])
+
+            def busy(j, chat_id, content, **kw):
+                return sched._WebuiBusyError("webui delivery busy")
+
+            monkeypatch.setattr(sched, "_deliver_to_webui", busy)
+            with caplog.at_level("INFO", logger="cron.scheduler"):
+                err = sched._deliver_result(job, "recurring report")
+            assert err is not None
+            assert "spooled" not in err
+            assert sched._load_pending_webui_spools() == []
+            msgs = [r.getMessage() for r in caplog.records]
+            # No scheduling claim anywhere in the recurring path…
+            assert not any(
+                "scheduling persistent redelivery" in m
+                or "spooled for redelivery" in m
+                for m in msgs
+            )
+            # …but the self-heal explanation IS present (t_70dd9cc7 INFO).
+            assert any(
+                "recurring job busy-exhausted" in m
+                and "next fire will retry delivery" in m
+                for m in msgs
+            )
 
     def test_terminal_error_does_not_spool(self, webui_env, monkeypatch, tmp_path):
         """404/401/5xx are not busy — no spool, honest error unchanged."""

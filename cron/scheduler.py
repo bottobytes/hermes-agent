@@ -2943,16 +2943,20 @@ def _deliver_to_webui(
                 # user finishes their turn): return the sentinel so the
                 # caller can spool for redelivery (t_ee4b2f97), while the
                 # string itself stays the honest last_delivery_error.
+                # t_70dd9cc7: neither this WARNING nor the sentinel makes a
+                # scheduling claim — whether anything is actually scheduled
+                # is decided by the CALLER (_deliver_result spools ONE-SHOTs
+                # only; recurring jobs self-heal on their next fire). The
+                # spool path's own "spooled for redelivery" WARNING carries
+                # that claim when it is true.
                 logger.warning(
-                    "Job '%s': webui session %s stayed busy through %d attempt(s); "
-                    "scheduling persistent redelivery",
+                    "Job '%s': webui session %s stayed busy through %d attempt(s)",
                     job_id, sid, attempt,
                 )
                 return _WebuiBusyError(
                     f"webui delivery to session {sid} failed (HTTP 409"
                     + (f": {detail}" if detail else "")
-                    + ") — session busy (active turn); persistent redelivery "
-                    "scheduled"
+                    + ") — session busy (active turn)"
                 )
             msg = (
                 f"webui delivery to session {sid} failed (HTTP {status}"
@@ -3791,6 +3795,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
                     if spooled:
                         webui_error = spooled
+                else:
+                    # t_70dd9cc7: nothing is scheduled for a recurring job —
+                    # its next fire retries delivery on its own — so say that
+                    # instead of letting the operator infer a queued
+                    # redelivery from the busy error above.
+                    logger.info(
+                        "Job '%s': recurring job busy-exhausted into webui "
+                        "session %s; keeping the plain error — next fire "
+                        "will retry delivery",
+                        job["id"], chat_id,
+                    )
             if webui_error:
                 delivery_errors.append(webui_error)
             continue
