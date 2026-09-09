@@ -10056,6 +10056,82 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# t_3371481a: staleness + live-credential gates for the respawn guard's
+# ``blocker_auth`` reason. Production incident (2026-09-09): quota walls
+# stamped quota-flavored ``last_failure_error`` strings onto 13 review cards;
+# the recovery cron re-armed only the ENGINEER cohort (``hermes kanban
+# reassign`` clears the string) so the REVIEW cohort's frozen strings kept
+# re-matching the blocker regex on every tick — 4.3h of silent starvation
+# while the reviewer's credentials were verified healthy by live probe. A
+# stored STRING is not live provider state: it must not hold a card once the
+# provider window has rolled or the pool marks are clean.
+# ---------------------------------------------------------------------------
+
+# A ``blocker_auth``-matching ``last_failure_error`` older than this (age from
+# the latest run's ``ended_at``) is stale by definition: quota windows roll in
+# minutes-to-an-hour, and the worst case of allowing a respawn is ONE fresh
+# rate-limited exit that re-stamps a fresh string (cheap, honest, observable).
+# 0 disables the staleness gate. Env-overridable below.
+DEFAULT_RESPAWN_GUARD_AUTH_STALENESS_SECONDS = 30 * 60  # 30 minutes
+
+# Provider tag extraction from kernel-stamped error text — matches the exact
+# shapes ``_classify_provider_death`` produces via the ``_who`` suffix:
+# "provider-quota-exhausted (zai)", "provider-auth-failed (byteplus)".
+# Empty provider (no banner in the tail) leaves the live-credential gate
+# inert and the staleness gate carries the release alone.
+_RESPAWN_GUARD_PROVIDER_TAG_RE = re.compile(
+    r"provider-(?:quota-exhausted|auth-failed|unreachable)\s*\(([^)]+)\)",
+    re.IGNORECASE,
+)
+
+# t_3371481a (incident follow-up, 14:44-14:46Z burst): per-CARD exponential
+# backoff for the ``rate_limit_cooldown`` reason. A provider that rejects
+# extra concurrent streams (429 with quota headroom — key at 5% usage) kills
+# respawns ~60s in; three back-to-back respawns then burn worker slots for
+# nothing. The cooldown now GROWS with the card's trailing run of
+# ``rate_limited`` outcomes (base = the flat cooldown, x2 per consecutive
+# bounce, capped) so burst cases space themselves out while genuine quota
+# walls (all keys exhausted) still hold via the blocker path. Key marks are
+# NEVER taken here — the guard is read-only on pools; only the runtime pool
+# itself decides exhaustion on real API responses.
+_RATE_LIMIT_BACKOFF_BASE_SECONDS = 300        # == DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+_RATE_LIMIT_BACKOFF_CAP_SECONDS = 30 * 60    # 30 minutes
+
+
+def _resolve_respawn_guard_auth_staleness_seconds() -> int:
+    """Return the ``blocker_auth`` staleness window in seconds.
+
+    Reads ``HERMES_KANBAN_RESPAWN_AUTH_STALENESS_SECONDS`` from the
+    environment; falls back to ``DEFAULT_RESPAWN_GUARD_AUTH_STALENESS_SECONDS``
+    when absent, empty, or negative. ``0`` disables the staleness gate.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_RESPAWN_AUTH_STALENESS_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_RESPAWN_GUARD_AUTH_STALENESS_SECONDS
+
+
+def _effective_respawn_auth_staleness_seconds() -> int:
+    """Staleness window, never shorter than the rate-limit backoff ceiling.
+
+    A staleness window below the longest cooldown would re-probe a card still
+    inside its backoff — harmless (step 1 returns first) but pointless; and
+    keeping the two coupled means shrinking the backoff cap never silently
+    outruns the staleness release.
+    """
+    base = _resolve_respawn_guard_auth_staleness_seconds()
+    if base <= 0:
+        return 0
+    return max(base, _RATE_LIMIT_BACKOFF_CAP_SECONDS)
+
 
 @dataclass
 class DispatchResult:
@@ -12187,6 +12263,241 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 # Legacy alias for test-code and anything else that still imports it.
 _clear_spawn_failures = _clear_failure_counter
+
+
+def _latest_failure_age_seconds(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[int]:
+    """Age of the task's most recent ENDED run, in seconds — else ``None``.
+
+    ``tasks.last_failure_error`` carries no timestamp of its own, so the
+    latest ``task_runs.ended_at`` is the best proxy for when the string was
+    stamped (every stamping path — the rate-limit requeue stamp, the
+    protocol-violation stamp, ``_record_task_failure`` — runs inside the
+    same transaction that closes the triggering run). Cards with no ended
+    run (a legacy row, or the failure was recorded pre-runs) get ``None``:
+    unknown age must NOT release a guard that a live credential check has
+    not already vouched for.
+    """
+    try:
+        row = conn.execute(
+            "SELECT ended_at FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row["ended_at"] is None:
+        return None
+    try:
+        return max(0, now - int(row["ended_at"]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pool_state_for_provider(auth_path: Path, provider: str) -> Optional[dict]:
+    """Read one provider's credential-pool state from a profile's auth.json.
+
+    Returns ``{provider, entries: [(last_status, last_status_at,
+    last_error_reset_at, failure_reason), ...]}`` — deliberately raw mark
+    tuples, no live objects — or ``None`` when nothing useful is on disk
+    (missing file, no ``credential_pool`` key, no pool for this provider,
+    unparsable JSON). Pure read; never takes locks, never writes.
+    """
+    try:
+        st = auth_path.stat()
+        sig = (str(auth_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    with _auth_pool_state_cache_lock:
+        hit = _auth_pool_state_cache.get(str(auth_path))
+        if hit is not None and hit[0] == sig:
+            cached = hit[1].get(provider)
+            return dict(cached) if cached is not None else None
+    try:
+        with open(auth_path, encoding="utf-8") as f:
+            doc = json.load(f)
+        pools = doc.get("credential_pool") if isinstance(doc, dict) else None
+        if not isinstance(pools, dict):
+            return None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    provider_state: dict = {}
+    for pool_name, entries in pools.items():
+        if not isinstance(entries, list):
+            continue
+        normalized = str(pool_name).strip().lower()
+        if normalized != provider.strip().lower():
+            continue
+        raw = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            raw.append((
+                e.get("last_status"),
+                e.get("last_status_at"),
+                e.get("last_error_reset_at"),
+                e.get("failure_reason"),
+            ))
+        provider_state[normalized] = {"entries": raw}
+    if not provider_state:
+        return None
+    payload = {normalized: {"entries": list(v["entries"])} for normalized, v in provider_state.items()}
+    with _auth_pool_state_cache_lock:
+        _auth_pool_state_cache[str(auth_path)] = (
+            sig,
+            {k: {"entries": list(v["entries"])} for k, v in provider_state.items()},
+        )
+    hit_entry = payload.get(provider.strip().lower())
+    return dict(hit_entry) if hit_entry is not None else None
+
+
+def _auth_blocker_stale(
+    conn: sqlite3.Connection, task_id: str, error_text: Optional[str],
+    assignee: Optional[str], *, now: Optional[int] = None,
+) -> "tuple[bool, str]":
+    """t_3371481a: should the ``blocker_auth`` regex hit be treated as STALE?
+
+    The stored ``last_failure_error`` is a string frozen at failure time; the
+    provider's real state moves on without it. Both gates are advisory
+    RELEASES from an otherwise-infinite guard — never extra holds:
+
+    * **Staleness gate.** The string predates the current provider recovery
+      window when the latest run's ``ended_at`` is older than the
+      configurable staleness window (default 30 min; 0 = disabled). The worst
+      case of releasing is ONE fresh rate-limited exit that re-stamps a fresh
+      string — cheap and observable — versus the pre-patch failure mode of a
+      card starving forever on a frozen string while credentials are healthy.
+
+    * **Live-credential gate.** The error names a provider (kernel-stamped
+      ``provider-quota-exhausted (zai)`` shape). Reading the ASSIGNEE
+      profile's ``auth.json`` credential pool for that provider: if at least
+      one non-DEAD entry has NO active exhausted mark (mark TTL already
+      expired — the runtime's own ``_exhausted_until`` semantics), the
+      provider has recovered or never lost quota headroom, and the frozen
+      string is stale by definition. The gate never fires when the pool
+      state is unreadable (fail-safe: unknown is NOT clean), when the pool
+      has no non-DEAD entries (freshly-authed pools get the benefit), or
+      when every non-DEAD entry is actively exhausted — the genuine-quota
+      case where the guard must HOLD.
+
+    Returns ``(is_stale, why)`` — ``why`` names the gate that released (for
+    the ``respawn_guarded`` payload so operators can audit releases). Pure
+    reads; never mutates pools, counters, or key marks.
+    """
+    if now is None:
+        now = int(time.time())
+    if not error_text:
+        return (False, "")
+
+    # Gate 1 — staleness of the stamped string.
+    staleness = _effective_respawn_auth_staleness_seconds()
+    if staleness > 0:
+        age = _latest_failure_age_seconds(conn, task_id, now)
+        if age is not None and age >= staleness:
+            return (True, f"stale_error_string: age {age}s >= {staleness}s window")
+
+    # Gate 2 — live credential state of the assignee's pool for the named
+    # provider. Unreadable/absent pool or unnamed provider: no opinion.
+    m = _RESPAWN_GUARD_PROVIDER_TAG_RE.search(error_text)
+    if not m:
+        return (False, "")
+    provider = m.group(1).strip()
+    if not provider:
+        return (False, "")
+    resolved = _resolve_assignee_home(assignee)
+    if resolved is None:
+        return (False, "")
+    state = _pool_state_for_provider(resolved / "auth.json", provider)
+    if state is None:
+        return (False, "")
+    entries = state.get("entries") or []
+    non_dead = [
+        e for e in entries
+        if str(e[0] or "").strip().lower() != "dead"
+    ]
+    if not non_dead:
+        # Pool entirely DEAD or empty — no live credential to vouch for a
+        # release; keep holding (the starvation detectors cover operator
+        # visibility).
+        return (False, "")
+    for status, status_at, reset_at, _reason in non_dead:
+        if str(status or "").strip().lower() != "exhausted":
+            return (True, f"live_credentials_clean: {provider} pool has an unmarked key")
+        # Exhausted mark — active or expired? Mirror the runtime's
+        # ``_exhausted_until`` precedence: explicit reset_at wins over
+        # status_at + TTL, and an absent/None until means the mark is
+        # timeless (treat as active — fail-safe hold).
+        until = _parse_provider_reset_timestamp(reset_at)
+        if until is None:
+            if status_at is None:
+                continue  # timeless mark with no clock — keep holding
+            try:
+                until = float(status_at) + _EXHAUSTED_MARK_TTL_FALLBACK_SECONDS
+            except (TypeError, ValueError):
+                continue
+        if float(until) <= float(now):
+            return (
+                True,
+                f"live_credentials_clean: {provider} pool mark expired at "
+                f"{int(until)} (now {now})",
+            )
+    return (False, "")
+
+
+_auth_pool_state_cache: dict = {}
+_auth_pool_state_cache_lock = threading.Lock()
+
+# Fallback TTL applied to an exhausted mark that carries a ``last_status_at``
+# but no explicit reset time — mirrors the runtime pool's default bench
+# (1 hour; 429s and the catch-all both bench an hour). A mark older than
+# this expired long before any staleness window we would honor.
+_EXHAUSTED_MARK_TTL_FALLBACK_SECONDS = 60 * 60
+
+# Provider-supplied reset timestamps can be epoch seconds, epoch millis, or
+# ISO-8601 strings — reuse the runtime's tolerant parser when importable and
+# fall back to a local minimal copy (dispatcher must not die on import).
+def _parse_provider_reset_timestamp(value) -> Optional[float]:
+    try:
+        from agent.credential_pool import _parse_absolute_timestamp
+
+        return _parse_absolute_timestamp(value)
+    except Exception:
+        pass
+    try:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            num = float(value)
+            return num if num > 0 else None
+        text = str(value).strip()
+        if not text:
+            return None
+        num = float(text)
+        if num > 1e12:  # epoch millis
+            num = num / 1000.0
+        return num if num > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_assignee_home(assignee: Optional[str]) -> Optional[Path]:
+    """Resolve a board assignee to its profile HERMES_HOME directory.
+
+    ``default``/empty/unresolvable → ``None``. Mirrors the resolution
+    ``_dispatch_profile_exists`` relies on (:func:`hermes_cli.profiles.
+    get_profile_dir`), with the same fail-open posture: any error is a
+    ``None``, never a crash.
+    """
+    name = (assignee or "").strip()
+    if not name:
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        p = get_profile_dir(name)
+        return p if p and p.is_dir() else None
+    except Exception:
+        return None
 
 
 def check_respawn_guard(
