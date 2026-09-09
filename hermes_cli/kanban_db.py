@@ -6413,8 +6413,10 @@ def detect_respawn_starved(
             _remedy = {
                 "blocker_auth": (
                     "last_failure_error matches the quota/auth regex — "
-                    "reassign (clears the error) or wait for the provider "
-                    "quota window"
+                    "reassign (clears the error), wait for the provider "
+                    "quota window, or check the assignee's key marks "
+                    "(t_3371481a: stale strings / clean pools now "
+                    "auto-release the guard)"
                 ),
                 "rate_limit_cooldown": (
                     "rate-limit cooldown — respawns cheaply once the "
@@ -10120,17 +10122,15 @@ def _resolve_respawn_guard_auth_staleness_seconds() -> int:
 
 
 def _effective_respawn_auth_staleness_seconds() -> int:
-    """Staleness window, never shorter than the rate-limit backoff ceiling.
+    """Deprecated clamp — retained for one release as a no-op alias.
 
-    A staleness window below the longest cooldown would re-probe a card still
-    inside its backoff — harmless (step 1 returns first) but pointless; and
-    keeping the two coupled means shrinking the backoff cap never silently
-    outruns the staleness release.
+    t_3371481a originally coupled the staleness window to the rate-limit
+    backoff cap; the two gates run on disjoint paths (the cooldown gate
+    returns before the staleness gate is ever consulted), so the coupling
+    only defeated operator configurability. Kept as an identity function
+    so any external caller keeps working; remove at the next bundle.
     """
-    base = _resolve_respawn_guard_auth_staleness_seconds()
-    if base <= 0:
-        return 0
-    return max(base, _RATE_LIMIT_BACKOFF_CAP_SECONDS)
+    return _resolve_respawn_guard_auth_staleness_seconds()
 
 
 @dataclass
@@ -12297,22 +12297,26 @@ def _latest_failure_age_seconds(conn: sqlite3.Connection, task_id: str, now: int
 def _pool_state_for_provider(auth_path: Path, provider: str) -> Optional[dict]:
     """Read one provider's credential-pool state from a profile's auth.json.
 
-    Returns ``{provider, entries: [(last_status, last_status_at,
+    Returns ``{"entries": [(last_status, last_status_at,
     last_error_reset_at, failure_reason), ...]}`` — deliberately raw mark
     tuples, no live objects — or ``None`` when nothing useful is on disk
     (missing file, no ``credential_pool`` key, no pool for this provider,
-    unparsable JSON). Pure read; never takes locks, never writes.
+    unparsable JSON). Pure read; never takes locks, never writes. The
+    mtime+size cache stores EVERY provider's pools so a hit for one
+    provider never masks another.
     """
+    key = str(auth_path)
+    want = provider.strip().lower()
     try:
-        st = auth_path.stat()
-        sig = (str(auth_path), st.st_mtime_ns, st.st_size)
+        st = Path(auth_path).stat()
+        sig = (key, st.st_mtime_ns, st.st_size)
     except OSError:
         return None
     with _auth_pool_state_cache_lock:
-        hit = _auth_pool_state_cache.get(str(auth_path))
+        hit = _auth_pool_state_cache.get(key)
         if hit is not None and hit[0] == sig:
-            cached = hit[1].get(provider)
-            return dict(cached) if cached is not None else None
+            cached = hit[1].get(want)
+            return {"entries": list(cached["entries"])} if cached is not None else None
     try:
         with open(auth_path, encoding="utf-8") as f:
             doc = json.load(f)
@@ -12321,12 +12325,9 @@ def _pool_state_for_provider(auth_path: Path, provider: str) -> Optional[dict]:
             return None
     except (OSError, json.JSONDecodeError, ValueError):
         return None
-    provider_state: dict = {}
+    parsed: dict = {}
     for pool_name, entries in pools.items():
         if not isinstance(entries, list):
-            continue
-        normalized = str(pool_name).strip().lower()
-        if normalized != provider.strip().lower():
             continue
         raw = []
         for e in entries:
@@ -12338,17 +12339,14 @@ def _pool_state_for_provider(auth_path: Path, provider: str) -> Optional[dict]:
                 e.get("last_error_reset_at"),
                 e.get("failure_reason"),
             ))
-        provider_state[normalized] = {"entries": raw}
-    if not provider_state:
-        return None
-    payload = {normalized: {"entries": list(v["entries"])} for normalized, v in provider_state.items()}
+        parsed[str(pool_name).strip().lower()] = {"entries": raw}
     with _auth_pool_state_cache_lock:
-        _auth_pool_state_cache[str(auth_path)] = (
+        _auth_pool_state_cache[key] = (
             sig,
-            {k: {"entries": list(v["entries"])} for k, v in provider_state.items()},
+            {k: {"entries": v["entries"]} for k, v in parsed.items()},
         )
-    hit_entry = payload.get(provider.strip().lower())
-    return dict(hit_entry) if hit_entry is not None else None
+    entry = parsed.get(want)
+    return {"entries": list(entry["entries"])} if entry is not None else None
 
 
 def _auth_blocker_stale(
@@ -12390,7 +12388,7 @@ def _auth_blocker_stale(
         return (False, "")
 
     # Gate 1 — staleness of the stamped string.
-    staleness = _effective_respawn_auth_staleness_seconds()
+    staleness = _resolve_respawn_guard_auth_staleness_seconds()
     if staleness > 0:
         age = _latest_failure_age_seconds(conn, task_id, now)
         if age is not None and age >= staleness:
@@ -12522,14 +12520,20 @@ def check_respawn_guard(
     ``"rate_limit_cooldown"``
         The task's most recent run ended with the ``rate_limited`` outcome
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
-        sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
-        quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
-        BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
-        quota-flavored ``last_failure_error`` that would otherwise match the
-        auth-blocker regex and park the task forever (the rate-limit path
-        never increments ``consecutive_failures``, so the breaker can't free
-        it). Once the cooldown elapses the task falls through and respawns.
+        sentinel) within the effective cooldown. The quota almost certainly
+        hasn't reset yet, so defer the respawn until the cooldown elapses —
+        then allow a cheap probe. This is checked BEFORE ``blocker_auth``
+        because the rate-limit requeue stamps a quota-flavored
+        ``last_failure_error`` that would otherwise match the auth-blocker
+        regex and park the task forever (the rate-limit path never
+        increments ``consecutive_failures``, so the breaker can't free it).
+        Once the cooldown elapses the task falls through and respawns.
+        t_3371481a: the cooldown now GROWS with the card's trailing run of
+        consecutive ``rate_limited`` outcomes (base x2 per bounce, capped)
+        so burst/concurrency 429s — the provider rejecting extra streams
+        while quota headroom exists — space their probes out instead of
+        burning a worker slot every flat window. Key marks are untouched:
+        only the runtime pool marks exhaustion from real API responses.
 
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
@@ -12540,6 +12544,12 @@ def check_respawn_guard(
         consecutive failures, so a persistent auth error eventually
         blocks via the normal path — but a transient 429 gets a few
         ticks of recovery first.
+        t_3371481a: the regex hit is now gated by a staleness and a
+        live-credential check (``_auth_blocker_stale``) — a frozen error
+        string must not starve a card after the provider window rolled
+        or the assignee's pool marks cleared. See that helper for the
+        exact release semantics; when neither gate releases, the guard
+        holds exactly as before.
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
@@ -12577,6 +12587,18 @@ def check_respawn_guard(
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
+    #
+    #    t_3371481a: the cooldown GROWS with the card's trailing run of
+    #    consecutive ``rate_limited`` outcomes. The 14:44-14:46Z incident:
+    #    a provider rejecting extra concurrent STREAMS (429 with quota
+    #    headroom — live probe showed 5% usage) killed three respawns in
+    #    ~60s each while the flat 300s window guaranteed a fresh bounce the
+    #    moment it elapsed. Doubling per consecutive bounce (capped) spaces
+    #    probes out exponentially while a genuine quota wall — where the
+    #    next run also dies rate-limited and the count keeps growing —
+    #    still holds. The counter is the card's trailing run of
+    #    ``rate_limited`` ENDED runs (a completion or any other outcome
+    #    breaks the streak), so a healthy card starts fresh at the base.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
@@ -12588,13 +12610,40 @@ def check_respawn_guard(
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
     ):
+        # Trailing run of consecutive rate_limited outcomes (this run
+        # included). Bounded fetch + Python prefix count: SQL alone can't
+        # express "leading run" cheaply, and 10 bounces deep the card has
+        # bigger problems than which cooldown tier it sits in.
+        try:
+            _outcomes = [
+                r[0] for r in conn.execute(
+                    "SELECT outcome FROM task_runs "
+                    "WHERE task_id = ? AND ended_at IS NOT NULL "
+                    "ORDER BY ended_at DESC LIMIT 10",
+                    (task_id,),
+                ).fetchall()
+            ]
+            rl_streak = 0
+            for _oc in _outcomes:
+                if _oc == "rate_limited":
+                    rl_streak += 1
+                else:
+                    break
+        except (sqlite3.Error, TypeError, ValueError):
+            rl_streak = 0
+        if rl_streak < 1:
+            rl_streak = 1
+        effective_cooldown = min(
+            max(rl_cooldown, 1) * (2 ** (rl_streak - 1)),
+            max(rl_cooldown, _RATE_LIMIT_BACKOFF_CAP_SECONDS),
+        )
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
             # blocker_auth regex so the stamped rate-limit text doesn't
             # re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        if ended_at is not None and (now - int(ended_at)) < effective_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
@@ -12606,6 +12655,24 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assignee = assignee_row["assignee"] if assignee_row is not None else None
+        stale, stale_why = _auth_blocker_stale(
+            conn, task_id, err, assignee, now=now,
+        )
+        if stale:
+            # Frozen string, live provider: allow the respawn. Worst case
+            # is ONE fresh rate-limited exit that re-stamps a fresh string
+            # (observable, cheap); the pre-patch failure mode was 4.3h of
+            # silent starvation on the review lane (t_3371481a).
+            _log.info(
+                "kanban: respawn guard released blocker_auth for %s (%s)",
+                task_id, stale_why,
+            )
+            return None
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -12848,7 +12915,10 @@ def escalate_dispatcher_stuck(
         "(`hermes kanban tail <id>`) for the dominant reason.",
         "- `blocker_auth` after a quota wall: reassign the card to a profile"
         " with quota (reassign clears `last_failure_error` and the guard),"
-        " or wait for the provider window.",
+        " or wait for the provider window. Kernel note (t_3371481a): a"
+        " stale error string (default 30m) or clean assignee key marks now"
+        " auto-release the guard — if the card still starves, the pool is"
+        " genuinely all-exhausted; check the assignee's key marks.",
         "- Work genuinely finished? Close the card — the dispatcher stops"
         " counting it once the ready queue drains.",
         "- This card is triage: it will never auto-spawn. Archive it when"
