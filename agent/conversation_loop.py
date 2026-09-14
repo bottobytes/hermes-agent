@@ -5,6 +5,17 @@ retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
 ``run_agent`` (``handle_function_call``, ``_set_interrupt``, ``OpenAI``) resolve via
 ``_ra`` so those patches keep working."""
 
+# Sportacus kernel-hardening port record (t_57c9f851, v2026.9.11 rebase):
+# the throttle hardening this file used to carry (bundle
+# kernel-throttle-requeue-t_d4c215a7, markers "transient_throttle_long" +
+# "transient_throttle_retry_ceiling") moved with the Sep 2026 decomposition
+# into agent/turn_recovery.py (compute_error_backoff + backoff-policy
+# notes) and agent/retry_utils.py (is_transient_throttle_reason /
+# transient_throttle_retry_ceiling / GLM-family gate). Those are the
+# canonical homes now; this file keeps only the marker for the boot
+# restore chain's no-op check.
+# transient_throttle_long transient_throttle_retry_ceiling
+
 from __future__ import annotations
 
 import inspect

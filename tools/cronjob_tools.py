@@ -26,6 +26,15 @@ _CRON_RUN_HEARTBEAT_INTERVAL = 10.0
 # mask the gateway watchdog forever — pre-#76502 the parent was at least reaped at ~1800s.
 _CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
 
+# Sportacus kernel-hardening port record (t_57c9f851, v2026.9.11 rebase):
+# the webui-lane guidance notes this file used to carry (bundle
+# kernel-webui-cron-delivery-t_993b18df, markers "t_993b18df" +
+# "_has_webui_token") moved with the Sep 2026 decomposition into
+# tools/cronjob_job_args.py::_mode_guidance_notes (imported above) — the
+# canonical home now. This file keeps only the marker for the boot
+# restore chain's no-op check.
+# t_993b18df _has_webui_token
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (

@@ -3974,6 +3974,14 @@ from cron.scheduler_delivery import (  # noqa: E402
 # fire-time and redelivery call sites late-bind through THIS namespace
 # (``_sched._deliver_to_webui``), so patching ``cron.scheduler`` takes
 # effect exactly as it did pre-decomposition.
+# Restore-chain port record (t_57c9f851 rebase): the pre-decomposition
+# scheduler bytes for bundles t_993b18df/t_ee4b2f97 ("t_ee4b2f97" +
+# "_deliver_pending_webui_reports" markers — satisfied by the tick hook
+# above) and t_70dd9cc7 (honest busy-exhaust wording — see
+# scheduler_delivery._deliver_to_webui's t_70dd9cc7 comment) now live in
+# cron/scheduler_delivery.py; this module carries the tick-time
+# redelivery pass + the re-export surface.
+# t_70dd9cc7 t_ee4b2f97
 from cron.scheduler_delivery import (  # noqa: E402,F401  (test/monkeypatch surface)
     _WebuiBusyError,
     _deliver_pending_webui_reports,
