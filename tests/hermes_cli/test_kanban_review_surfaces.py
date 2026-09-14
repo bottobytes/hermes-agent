@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -21,12 +22,13 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     # t_fbd0fb38: write-time assignee validation is ON by default; the
     # synthetic reviewers below ("reviewer", "builder") name no real profile
-    # under the tmp home (house pattern: all_assignees_spawnable).
+    # under the tmp home (house pattern: all_assignees_spawnable). This also
+    # satisfies upstream's #106163 installed-profile check.
     import hermes_cli.profiles as _profiles
     monkeypatch.setattr(_profiles, "profile_exists", lambda name: True)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="Review tool contract", assignee="builder")
         task = kb.claim_task(conn, task_id, claimer="builder:1")
         assert task is not None
@@ -51,7 +53,7 @@ def test_review_tools_redact_handoff_and_route_changes(
     )
     assert requested["ok"] is True
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, review_worker)
         assert task is not None
         assert task.status == "review"
@@ -74,7 +76,7 @@ def test_review_tools_redact_handoff_and_route_changes(
     assert changed["ok"] is True
     assert changed["implementer"] == "builder"
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, review_worker)
         assert task is not None
         assert task.status == "ready"
@@ -110,12 +112,17 @@ def test_review_tools_are_gated_and_visible_to_kanban_workers(
     assert "kanban_request_review" in names
     assert "kanban_request_changes" in names
 
-    from acp_adapter.tools import _POLISHED_TOOLS
     from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
 
-    assert "kanban_request_changes" in _POLISHED_TOOLS
     assert "kanban_request_changes" in EXPOSED_TOOLS
     assert "kanban_request_changes" in resolve_toolset("kanban")
+
+
+def test_review_changes_are_exposed_in_acp() -> None:
+    pytest.importorskip("acp", reason="ACP adapter requires the optional acp extra")
+    from acp_adapter.tools import _POLISHED_TOOLS
+
+    assert "kanban_request_changes" in _POLISHED_TOOLS
 
 
 def test_review_cli_round_trip_preserves_handoff(
@@ -129,7 +136,7 @@ def test_review_cli_round_trip_preserves_handoff(
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = kb.create_task(conn, title="CLI review", assignee="builder")
         implementation = kb.claim_task(conn, task_id, claimer="builder:1")
         assert implementation is not None
@@ -142,7 +149,7 @@ def test_review_cli_round_trip_preserves_handoff(
     )
     assert "Requested review" in output
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.assignee == "reviewer"
@@ -157,7 +164,7 @@ def test_review_cli_round_trip_preserves_handoff(
         f"request-changes {task_id} 'cover the malformed payload case'"
     )
     assert "Requested changes" in output
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, task_id)
         assert task is not None
         assert task.status == "ready"
@@ -173,7 +180,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
     monkeypatch.setenv("HERMES_HOME", str(home))
     secret = "ghp_" + "R" * 40
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         direct_id = kb.create_task(conn, title="direct redaction", assignee="builder")
         direct_run = kb.claim_task(conn, direct_id)
         assert direct_run is not None
@@ -218,7 +225,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
     )
     assert "Requested review" in cli_output
     assert secret not in cli_output
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         run = kb.latest_run(conn, cli_id)
         event = [
             item for item in kb.list_events(conn, cli_id)
@@ -261,7 +268,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     secret = "ghp_" + "Q" * 40
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         invalid_id = kb.create_task(conn, title="not review", assignee="builder")
         review_id = kb.create_task(conn, title="review", assignee="builder")
         assert kb.request_review(conn, review_id, summary="ready")
@@ -270,7 +277,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
         f'reopen-review {invalid_id} --reason "invalid {secret}"'
     )
     assert "cannot reopen" in invalid_output
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.list_comments(conn, invalid_id) == []
 
     success_output = kc.run_slash(
@@ -278,7 +285,7 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
     )
     assert "Reopened" in success_output
     assert secret not in success_output
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task = kb.get_task(conn, review_id)
         assert task is not None
         assert task.status == "ready"
@@ -298,7 +305,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tool_task = kb.create_task(
             conn,
             title="Goal-mode tool task",
@@ -327,13 +334,13 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     rejected = json.loads(tools._handle_request_review({"summary": "Looks ready."}))
     assert "error" in rejected
     assert "rejected by judge" in rejected["error"]
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tool_after = kb.get_task(conn, tool_task)
         assert tool_after is not None
         assert tool_after.status == "running"
 
     # The shell/CLI path applies the same gate and must not bypass the tool.
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         cli_task = kb.create_task(
             conn,
             title="Goal-mode CLI task",
@@ -360,7 +367,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
     )
     output = kc.run_slash(f"request-review {cli_task} --summary 'Looks ready.'")
     assert "rejected by judge" in output
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         cli_after = kb.get_task(conn, cli_task)
         assert cli_after is not None
         assert cli_after.status == "running"
@@ -401,7 +408,7 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         parent_id = kb.create_task(conn, title="Implementation", assignee="builder")
         child_id = kb.create_task(
             conn,
@@ -426,7 +433,7 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
 
     from plugins.kanban.dashboard.plugin_api import _compute_task_diagnostics
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         dashboard = _compute_task_diagnostics(conn, task_ids=[parent_id])
     assert dashboard[parent_id][0]["kind"] == "review_dependency_deadlock"
     assert dashboard[parent_id][0]["data"]["waiting_child_ids"] == [child_id]
