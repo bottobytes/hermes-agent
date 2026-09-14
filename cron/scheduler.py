@@ -3703,6 +3703,20 @@ def tick(
         due_jobs = get_due_jobs()
         _sweep_stale_inflight_for_tick(due_jobs)
 
+        # t_ee4b2f97: redeliver spooled webui reports (busy-session defers)
+        # on EVERY tick — including idle ticks, which is exactly when the
+        # operator has stopped typing and the session has gone idle. Never
+        # raises; broken spool state must not take the ticker down.
+        try:
+            _redelivered = _deliver_pending_webui_reports()
+            if _redelivered and verbose:
+                logger.info(
+                    "%s - redelivered %d deferred webui report(s)",
+                    _hermes_now().strftime('%H:%M:%S'), _redelivered,
+                )
+        except Exception as _e:
+            logger.debug("Pending webui redelivery pass failed: %s", _e)
+
         if not due_jobs:
             # Idle tick: skip config load + pool setup, but still reap crashed jobs' MCP orphans.
             if verbose:
@@ -3770,6 +3784,22 @@ from cron.scheduler_delivery import (  # noqa: E402
     _deliver_result, _delivery_lane_value, _normalize_deliver_value, _resolve_delivery_target,
     _resolve_delivery_targets,
 )
+# t_993b18df/t_ee4b2f97 webui delivery lane: the lane lives in
+# scheduler_delivery; these names are imported here because scheduler.py is
+# the module callers (and the kernel test-suite) monkeypatch — the lane's
+# fire-time and redelivery call sites late-bind through THIS namespace
+# (``_sched._deliver_to_webui``), so patching ``cron.scheduler`` takes
+# effect exactly as it did pre-decomposition.
+from cron.scheduler_delivery import (  # noqa: E402,F401  (test/monkeypatch surface)
+    _WebuiBusyError,
+    _deliver_pending_webui_reports,
+    _deliver_to_webui,
+    _is_known_delivery_platform,
+    _load_pending_webui_spools,
+    _webui_pending_dir,
+    _spool_pending_webui_delivery,
+    WEBUI_DELIVERY_PLATFORM,
+)
 from cron.scheduler_script import (  # noqa: E402
     _get_session_db_timeout, _run_job_script_with_claim_heartbeat, _start_heartbeat_thread,
 )
@@ -3780,6 +3810,7 @@ from cron.scheduler_preflight import (  # noqa: E402
     BLOCKED_CONFIG_MARKER, BLOCKED_CONFIG_SILENT_MARKER, _cron_preflight_enabled,
     _is_transient_provider_resolve_error, _preflight_job_config,
 )
+from cron.scheduler_preflight import _preflight_check_delivery  # noqa: E402,F401 (webui-lane test surface, t_993b18df)
 
 
 # `python -m cron.scheduler` entry: MUST stay below the split-module imports so the worker /

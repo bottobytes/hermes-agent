@@ -221,8 +221,8 @@ def notify_task_updated(
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
-    "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "respawn_guarded", "skipped_per_profile_capped", "skipped_review_lane_capped",
+    "skipped_unassigned", "skipped_nonspawnable",
 )
 
 
@@ -5548,8 +5548,10 @@ def detect_respawn_starved(
             _remedy = {
                 "blocker_auth": (
                     "last_failure_error matches the quota/auth regex — "
-                    "reassign (clears the error) or wait for the provider "
-                    "quota window"
+                    "reassign (clears the error), wait for the provider "
+                    "quota window, or check the assignee's key marks "
+                    "(t_3371481a: stale strings / clean pools now "
+                    "auto-release the guard)"
                 ),
                 "rate_limit_cooldown": (
                     "rate-limit cooldown — respawns cheaply once the "
@@ -7504,6 +7506,80 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# t_3371481a: staleness + live-credential gates for the respawn guard's
+# ``blocker_auth`` reason. Production incident (2026-09-09): quota walls
+# stamped quota-flavored ``last_failure_error`` strings onto 13 review cards;
+# the recovery cron re-armed only the ENGINEER cohort (``hermes kanban
+# reassign`` clears the string) so the REVIEW cohort's frozen strings kept
+# re-matching the blocker regex on every tick — 4.3h of silent starvation
+# while the reviewer's credentials were verified healthy by live probe. A
+# stored STRING is not live provider state: it must not hold a card once the
+# provider window has rolled or the pool marks are clean.
+# ---------------------------------------------------------------------------
+
+# A ``blocker_auth``-matching ``last_failure_error`` older than this (age from
+# the latest run's ``ended_at``) is stale by definition: quota windows roll in
+# minutes-to-an-hour, and the worst case of allowing a respawn is ONE fresh
+# rate-limited exit that re-stamps a fresh string (cheap, honest, observable).
+# 0 disables the staleness gate. Env-overridable below.
+DEFAULT_RESPAWN_GUARD_AUTH_STALENESS_SECONDS = 30 * 60  # 30 minutes
+
+# Provider tag extraction from kernel-stamped error text — matches the exact
+# shapes ``_classify_provider_death`` produces via the ``_who`` suffix:
+# "provider-quota-exhausted (zai)", "provider-auth-failed (byteplus)".
+# Empty provider (no banner in the tail) leaves the live-credential gate
+# inert and the staleness gate carries the release alone.
+_RESPAWN_GUARD_PROVIDER_TAG_RE = re.compile(
+    r"provider-(?:quota-exhausted|auth-failed|unreachable)\s*\(([^)]+)\)",
+    re.IGNORECASE,
+)
+
+# t_3371481a (incident follow-up, 14:44-14:46Z burst): per-CARD exponential
+# backoff for the ``rate_limit_cooldown`` reason. A provider that rejects
+# extra concurrent streams (429 with quota headroom — key at 5% usage) kills
+# respawns ~60s in; three back-to-back respawns then burn worker slots for
+# nothing. The cooldown now GROWS with the card's trailing run of
+# ``rate_limited`` outcomes (base = the flat cooldown, x2 per consecutive
+# bounce, capped) so burst cases space themselves out while genuine quota
+# walls (all keys exhausted) still hold via the blocker path. Key marks are
+# NEVER taken here — the guard is read-only on pools; only the runtime pool
+# itself decides exhaustion on real API responses.
+_RATE_LIMIT_BACKOFF_BASE_SECONDS = 300        # == DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+_RATE_LIMIT_BACKOFF_CAP_SECONDS = 30 * 60    # 30 minutes
+
+
+def _resolve_respawn_guard_auth_staleness_seconds() -> int:
+    """Return the ``blocker_auth`` staleness window in seconds.
+
+    Reads ``HERMES_KANBAN_RESPAWN_AUTH_STALENESS_SECONDS`` from the
+    environment; falls back to ``DEFAULT_RESPAWN_GUARD_AUTH_STALENESS_SECONDS``
+    when absent, empty, or negative. ``0`` disables the staleness gate.
+    """
+    raw = os.environ.get(
+        "HERMES_KANBAN_RESPAWN_AUTH_STALENESS_SECONDS", ""
+    ).strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = -1
+        if parsed >= 0:
+            return parsed
+    return DEFAULT_RESPAWN_GUARD_AUTH_STALENESS_SECONDS
+
+
+def _effective_respawn_auth_staleness_seconds() -> int:
+    """Deprecated clamp — retained for one release as a no-op alias.
+
+    t_3371481a originally coupled the staleness window to the rate-limit
+    backoff cap; the two gates run on disjoint paths (the cooldown gate
+    returns before the staleness gate is ever consulted), so the coupling
+    only defeated operator configurability. Kept as an identity function
+    so any external caller keeps working; remove at the next bundle.
+    """
+    return _resolve_respawn_guard_auth_staleness_seconds()
+
 
 @dataclass
 class DispatchResult:
@@ -7563,6 +7639,16 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_review_lane_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Review cards deferred this tick because their assignee is already
+    at the review-LANE cap (t_a0d28a97: ``kanban.review_lane_max_parallel``
+    or ``kanban.review_lane_max_parallel_map``). Each entry is
+    ``(task_id, assignee, current_review_lane_count)``. Same clean-skip
+    semantics as ``skipped_per_profile_capped`` — no events, no failure
+    ticks, no guard: the card stays review-queued with clean fields until
+    the assignee's surviving review lane finishes, exactly the visual of
+    a full lane (the review-spawn-starvation detector remains the
+    observability net for a lane that NEVER drains)."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9637,6 +9723,239 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _latest_failure_age_seconds(conn: sqlite3.Connection, task_id: str, now: int) -> Optional[int]:
+    """Age of the task's most recent ENDED run, in seconds — else ``None``.
+
+    ``tasks.last_failure_error`` carries no timestamp of its own, so the
+    latest ``task_runs.ended_at`` is the best proxy for when the string was
+    stamped (every stamping path — the rate-limit requeue stamp, the
+    protocol-violation stamp, ``_record_task_failure`` — runs inside the
+    same transaction that closes the triggering run). Cards with no ended
+    run (a legacy row, or the failure was recorded pre-runs) get ``None``:
+    unknown age must NOT release a guard that a live credential check has
+    not already vouched for.
+    """
+    try:
+        row = conn.execute(
+            "SELECT ended_at FROM task_runs "
+            "WHERE task_id = ? AND ended_at IS NOT NULL "
+            "ORDER BY ended_at DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None or row["ended_at"] is None:
+        return None
+    try:
+        return max(0, now - int(row["ended_at"]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _pool_state_for_provider(auth_path: Path, provider: str) -> Optional[dict]:
+    """Read one provider's credential-pool state from a profile's auth.json.
+
+    Returns ``{"entries": [(last_status, last_status_at,
+    last_error_reset_at, failure_reason), ...]}`` — deliberately raw mark
+    tuples, no live objects — or ``None`` when nothing useful is on disk
+    (missing file, no ``credential_pool`` key, no pool for this provider,
+    unparsable JSON). Pure read; never takes locks, never writes. The
+    mtime+size cache stores EVERY provider's pools so a hit for one
+    provider never masks another.
+    """
+    key = str(auth_path)
+    want = provider.strip().lower()
+    try:
+        st = Path(auth_path).stat()
+        sig = (key, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    with _auth_pool_state_cache_lock:
+        hit = _auth_pool_state_cache.get(key)
+        if hit is not None and hit[0] == sig:
+            cached = hit[1].get(want)
+            return {"entries": list(cached["entries"])} if cached is not None else None
+    try:
+        with open(auth_path, encoding="utf-8") as f:
+            doc = json.load(f)
+        pools = doc.get("credential_pool") if isinstance(doc, dict) else None
+        if not isinstance(pools, dict):
+            return None
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    parsed: dict = {}
+    for pool_name, entries in pools.items():
+        if not isinstance(entries, list):
+            continue
+        raw = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            raw.append((
+                e.get("last_status"),
+                e.get("last_status_at"),
+                e.get("last_error_reset_at"),
+                e.get("failure_reason"),
+            ))
+        parsed[str(pool_name).strip().lower()] = {"entries": raw}
+    with _auth_pool_state_cache_lock:
+        _auth_pool_state_cache[key] = (
+            sig,
+            {k: {"entries": v["entries"]} for k, v in parsed.items()},
+        )
+    entry = parsed.get(want)
+    return {"entries": list(entry["entries"])} if entry is not None else None
+
+
+def _auth_blocker_stale(
+    conn: sqlite3.Connection, task_id: str, error_text: Optional[str],
+    assignee: Optional[str], *, now: Optional[int] = None,
+) -> "tuple[bool, str]":
+    """t_3371481a: should the ``blocker_auth`` regex hit be treated as STALE?
+
+    The stored ``last_failure_error`` is a string frozen at failure time; the
+    provider's real state moves on without it. Both gates are advisory
+    RELEASES from an otherwise-infinite guard — never extra holds:
+
+    * **Staleness gate.** The string predates the current provider recovery
+      window when the latest run's ``ended_at`` is older than the
+      configurable staleness window (default 30 min; 0 = disabled). The worst
+      case of releasing is ONE fresh rate-limited exit that re-stamps a fresh
+      string — cheap and observable — versus the pre-patch failure mode of a
+      card starving forever on a frozen string while credentials are healthy.
+
+    * **Live-credential gate.** The error names a provider (kernel-stamped
+      ``provider-quota-exhausted (zai)`` shape). Reading the ASSIGNEE
+      profile's ``auth.json`` credential pool for that provider: if at least
+      one non-DEAD entry has NO active exhausted mark (mark TTL already
+      expired — the runtime's own ``_exhausted_until`` semantics), the
+      provider has recovered or never lost quota headroom, and the frozen
+      string is stale by definition. The gate never fires when the pool
+      state is unreadable (fail-safe: unknown is NOT clean), when the pool
+      has no non-DEAD entries (freshly-authed pools get the benefit), or
+      when every non-DEAD entry is actively exhausted — the genuine-quota
+      case where the guard must HOLD.
+
+    Returns ``(is_stale, why)`` — ``why`` names the gate that released (for
+    the ``respawn_guarded`` payload so operators can audit releases). Pure
+    reads; never mutates pools, counters, or key marks.
+    """
+    if now is None:
+        now = int(time.time())
+    if not error_text:
+        return (False, "")
+
+    # Gate 1 — staleness of the stamped string.
+    staleness = _resolve_respawn_guard_auth_staleness_seconds()
+    if staleness > 0:
+        age = _latest_failure_age_seconds(conn, task_id, now)
+        if age is not None and age >= staleness:
+            return (True, f"stale_error_string: age {age}s >= {staleness}s window")
+
+    # Gate 2 — live credential state of the assignee's pool for the named
+    # provider. Unreadable/absent pool or unnamed provider: no opinion.
+    m = _RESPAWN_GUARD_PROVIDER_TAG_RE.search(error_text)
+    if not m:
+        return (False, "")
+    provider = m.group(1).strip()
+    if not provider:
+        return (False, "")
+    resolved = _resolve_assignee_home(assignee)
+    if resolved is None:
+        return (False, "")
+    state = _pool_state_for_provider(resolved / "auth.json", provider)
+    if state is None:
+        return (False, "")
+    entries = state.get("entries") or []
+    non_dead = [
+        e for e in entries
+        if str(e[0] or "").strip().lower() != "dead"
+    ]
+    if not non_dead:
+        # Pool entirely DEAD or empty — no live credential to vouch for a
+        # release; keep holding (the starvation detectors cover operator
+        # visibility).
+        return (False, "")
+    for status, status_at, reset_at, _reason in non_dead:
+        if str(status or "").strip().lower() != "exhausted":
+            return (True, f"live_credentials_clean: {provider} pool has an unmarked key")
+        # Exhausted mark — active or expired? Mirror the runtime's
+        # ``_exhausted_until`` precedence: explicit reset_at wins over
+        # status_at + TTL, and an absent/None until means the mark is
+        # timeless (treat as active — fail-safe hold).
+        until = _parse_provider_reset_timestamp(reset_at)
+        if until is None:
+            if status_at is None:
+                continue  # timeless mark with no clock — keep holding
+            try:
+                until = float(status_at) + _EXHAUSTED_MARK_TTL_FALLBACK_SECONDS
+            except (TypeError, ValueError):
+                continue
+        if float(until) <= float(now):
+            return (
+                True,
+                f"live_credentials_clean: {provider} pool mark expired at "
+                f"{int(until)} (now {now})",
+            )
+    return (False, "")
+
+
+_auth_pool_state_cache: dict = {}
+_auth_pool_state_cache_lock = threading.Lock()
+
+# Fallback TTL applied to an exhausted mark that carries a ``last_status_at``
+# but no explicit reset time — mirrors the runtime pool's default bench
+# (1 hour; 429s and the catch-all both bench an hour). A mark older than
+# this expired long before any staleness window we would honor.
+_EXHAUSTED_MARK_TTL_FALLBACK_SECONDS = 60 * 60
+
+# Provider-supplied reset timestamps can be epoch seconds, epoch millis, or
+# ISO-8601 strings — reuse the runtime's tolerant parser when importable and
+# fall back to a local minimal copy (dispatcher must not die on import).
+def _parse_provider_reset_timestamp(value) -> Optional[float]:
+    try:
+        from agent.credential_pool import _parse_absolute_timestamp
+
+        return _parse_absolute_timestamp(value)
+    except Exception:
+        pass
+    try:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)):
+            num = float(value)
+            return num if num > 0 else None
+        text = str(value).strip()
+        if not text:
+            return None
+        num = float(text)
+        if num > 1e12:  # epoch millis
+            num = num / 1000.0
+        return num if num > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_assignee_home(assignee: Optional[str]) -> Optional[Path]:
+    """Resolve a board assignee to its profile HERMES_HOME directory.
+
+    ``default``/empty/unresolvable → ``None``. Mirrors the resolution
+    ``_dispatch_profile_exists`` relies on (:func:`hermes_cli.profiles.
+    get_profile_dir`), with the same fail-open posture: any error is a
+    ``None``, never a crash.
+    """
+    name = (assignee or "").strip()
+    if not name:
+        return None
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        p = get_profile_dir(name)
+        return p if p and p.is_dir() else None
+    except Exception:
+        return None
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -9659,14 +9978,20 @@ def check_respawn_guard(
     ``"rate_limit_cooldown"``
         The task's most recent run ended with the ``rate_limited`` outcome
         (a worker bailed on a provider quota wall via the EX_TEMPFAIL
-        sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
-        quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
-        BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
-        quota-flavored ``last_failure_error`` that would otherwise match the
-        auth-blocker regex and park the task forever (the rate-limit path
-        never increments ``consecutive_failures``, so the breaker can't free
-        it). Once the cooldown elapses the task falls through and respawns.
+        sentinel) within the effective cooldown. The quota almost certainly
+        hasn't reset yet, so defer the respawn until the cooldown elapses —
+        then allow a cheap probe. This is checked BEFORE ``blocker_auth``
+        because the rate-limit requeue stamps a quota-flavored
+        ``last_failure_error`` that would otherwise match the auth-blocker
+        regex and park the task forever (the rate-limit path never
+        increments ``consecutive_failures``, so the breaker can't free it).
+        Once the cooldown elapses the task falls through and respawns.
+        t_3371481a: the cooldown now GROWS with the card's trailing run of
+        consecutive ``rate_limited`` outcomes (base x2 per bounce, capped)
+        so burst/concurrency 429s — the provider rejecting extra streams
+        while quota headroom exists — space their probes out instead of
+        burning a worker slot every flat window. Key marks are untouched:
+        only the runtime pool marks exhaustion from real API responses.
 
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
@@ -9677,6 +10002,12 @@ def check_respawn_guard(
         consecutive failures, so a persistent auth error eventually
         blocks via the normal path — but a transient 429 gets a few
         ticks of recovery first.
+        t_3371481a: the regex hit is now gated by a staleness and a
+        live-credential check (``_auth_blocker_stale``) — a frozen error
+        string must not starve a card after the provider window rolled
+        or the assignee's pool marks cleared. See that helper for the
+        exact release semantics; when neither gate releases, the guard
+        holds exactly as before.
 
     ``"recent_success"``
         A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
@@ -9714,6 +10045,18 @@ def check_respawn_guard(
     #    We look at the LATEST run only (ORDER BY ended_at DESC LIMIT 1): if a
     #    newer crash/completion superseded the rate-limit run, this guard
     #    no longer applies and the normal paths take over.
+    #
+    #    t_3371481a: the cooldown GROWS with the card's trailing run of
+    #    consecutive ``rate_limited`` outcomes. The 14:44-14:46Z incident:
+    #    a provider rejecting extra concurrent STREAMS (429 with quota
+    #    headroom — live probe showed 5% usage) killed three respawns in
+    #    ~60s each while the flat 300s window guaranteed a fresh bounce the
+    #    moment it elapsed. Doubling per consecutive bounce (capped) spaces
+    #    probes out exponentially while a genuine quota wall — where the
+    #    next run also dies rate-limited and the count keeps growing —
+    #    still holds. The counter is the card's trailing run of
+    #    ``rate_limited`` ENDED runs (a completion or any other outcome
+    #    breaks the streak), so a healthy card starts fresh at the base.
     rl_cooldown = _resolve_rate_limit_cooldown_seconds()
     latest_run = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
@@ -9725,13 +10068,40 @@ def check_respawn_guard(
         latest_run is not None
         and latest_run["outcome"] == "rate_limited"
     ):
+        # Trailing run of consecutive rate_limited outcomes (this run
+        # included). Bounded fetch + Python prefix count: SQL alone can't
+        # express "leading run" cheaply, and 10 bounces deep the card has
+        # bigger problems than which cooldown tier it sits in.
+        try:
+            _outcomes = [
+                r[0] for r in conn.execute(
+                    "SELECT outcome FROM task_runs "
+                    "WHERE task_id = ? AND ended_at IS NOT NULL "
+                    "ORDER BY ended_at DESC LIMIT 10",
+                    (task_id,),
+                ).fetchall()
+            ]
+            rl_streak = 0
+            for _oc in _outcomes:
+                if _oc == "rate_limited":
+                    rl_streak += 1
+                else:
+                    break
+        except (sqlite3.Error, TypeError, ValueError):
+            rl_streak = 0
+        if rl_streak < 1:
+            rl_streak = 1
+        effective_cooldown = min(
+            max(rl_cooldown, 1) * (2 ** (rl_streak - 1)),
+            max(rl_cooldown, _RATE_LIMIT_BACKOFF_CAP_SECONDS),
+        )
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
             # blocker_auth regex so the stamped rate-limit text doesn't
             # re-trap the task.
             return None
         ended_at = latest_run["ended_at"]
-        if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
+        if ended_at is not None and (now - int(ended_at)) < effective_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — allow the respawn. Return early so the
         # blocker_auth check below doesn't catch the rate-limit text we
@@ -9743,6 +10113,24 @@ def check_respawn_guard(
     # 2. Quota / auth blocker: retrying immediately will not help.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
+        assignee_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assignee = assignee_row["assignee"] if assignee_row is not None else None
+        stale, stale_why = _auth_blocker_stale(
+            conn, task_id, err, assignee, now=now,
+        )
+        if stale:
+            # Frozen string, live provider: allow the respawn. Worst case
+            # is ONE fresh rate-limited exit that re-stamps a fresh string
+            # (observable, cheap); the pre-patch failure mode was 4.3h of
+            # silent starvation on the review lane (t_3371481a).
+            _log.info(
+                "kanban: respawn guard released blocker_auth for %s (%s)",
+                task_id, stale_why,
+            )
+            return None
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR
@@ -9985,7 +10373,10 @@ def escalate_dispatcher_stuck(
         "(`hermes kanban tail <id>`) for the dominant reason.",
         "- `blocker_auth` after a quota wall: reassign the card to a profile"
         " with quota (reassign clears `last_failure_error` and the guard),"
-        " or wait for the provider window.",
+        " or wait for the provider window. Kernel note (t_3371481a): a"
+        " stale error string (default 30m) or clean assignee key marks now"
+        " auto-release the guard — if the card still starves, the pool is"
+        " genuinely all-exhausted; check the assignee's key marks.",
         "- Work genuinely finished? Close the card — the dispatcher stops"
         " counting it once the ready queue drains.",
         "- This card is triage: it will never auto-spawn. Archive it when"
@@ -10143,6 +10534,28 @@ def _root_kanban_cfg_candidates() -> list:
     real_home = os.environ.get("HERMES_REAL_HOME", "").strip()
     if real_home:
         candidates.append(("real_home", Path(real_home) / ".hermes" / "config.yaml"))
+    # t_d3f69e96: profile-mode derivation. A worker (or any hand-launched
+    # ``hermes -p <profile>`` session) runs with HERMES_HOME=<root>/profiles/
+    # <name> and, before the spawn-side fix, no HERMES_REAL_HOME at all —
+    # candidates used to fall straight to get_config_path(), i.e. the
+    # PROFILE's own (knob-less) config, and the root kanban block was
+    # silently invisible (live: review auto-route dead for worker-originated
+    # requests, Sep 9). ``get_default_hermes_root()`` is the kernel's own
+    # profile-aware root resolver (it maps <root>/profiles/<name> back to
+    # <root>); only a candidate that DIFFERS from the active home is worth
+    # trying, so vanilla installs (root == active home) are unchanged.
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        _derived_root = str(get_default_hermes_root()).strip()
+        _active_home = os.environ.get("HERMES_HOME", "").strip()
+        if _derived_root and _derived_root != _active_home:
+            # NB: get_default_hermes_root() already returns the .hermes root
+            # (~/.hermes), unlike HERMES_REAL_HOME which is the OS home —
+            # the config sits directly inside it.
+            candidates.append(("derived_root", Path(_derived_root) / "config.yaml"))
+    except Exception:
+        pass
     try:
         from hermes_cli.config import get_config_path
 
@@ -10223,6 +10636,112 @@ def per_profile_cap_map() -> dict:
         if key:
             out[key] = pcap
     return out
+
+
+def review_lane_max_parallel() -> Optional[int]:
+    """Scalar per-profile review-lane concurrency cap (t_a0d28a97).
+
+    The Captain's 2026-09-09 12:25Z ruling — a reviewer profile on a
+    shared model pool must stay SERIAL (parallel heavy review workers
+    burn the pool and cause fleet-wide rate-limit walls). The dispatcher
+    historically had no lane-specific cap: every claimable review card
+    got its own worker (four simultaneous review lanes on 2026-09-09),
+    bounded only by the TOTAL per-profile cap
+    (``max_in_progress_per_profile_map``), which is sized for
+    implementation fan-out, not for serialized review traffic.
+
+    Resolution mirrors ``_resolve_review_spawn_starved_seconds``:
+    ``HERMES_KANBAN_REVIEW_LANE_MAX_PARALLEL`` env (int >= 1) wins, then
+    ``kanban.review_lane_max_parallel`` from the ROOT config, then
+    ``None`` — no review-lane cap, the pre-t_a0d28a97 behaviour. Per
+    profile, ``kanban.review_lane_max_parallel_map`` (see
+    :func:`review_lane_cap_map`) overrides this scalar. Invalid /
+    non-positive values fall through to the next source silently.
+    """
+    raw_env = os.environ.get(
+        "HERMES_KANBAN_REVIEW_LANE_MAX_PARALLEL", ""
+    ).strip()
+    if raw_env:
+        try:
+            parsed = int(raw_env)
+        except ValueError:
+            parsed = -1
+        if parsed >= 1:
+            return parsed
+    raw = _load_root_kanban_cfg().get("review_lane_max_parallel")
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
+def review_lane_cap_map() -> dict:
+    """Per-profile review-lane cap overrides (t_a0d28a97).
+
+    ``kanban.review_lane_max_parallel_map`` — mapping of profile name to
+    the per-profile cap on concurrent REVIEW-origin workers that wins
+    over the scalar ``kanban.review_lane_max_parallel`` for that profile
+    (e.g. ``sportacus-reviewer: 1`` encodes the serial-reviewer ruling
+    without constraining other profiles' review lanes). Same
+    normalization/fail-open contract as :func:`per_profile_cap_map`:
+    keys stripped + lowercased, invalid entries (non-int, < 1, booleans)
+    dropped, non-dict value yields ``{}``.
+    """
+    raw = _load_root_kanban_cfg().get("review_lane_max_parallel_map")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for pname, pcap in raw.items():
+        if isinstance(pcap, bool) or not isinstance(pcap, int) or pcap < 1:
+            continue
+        key = str(pname or "").strip().lower()
+        if key:
+            out[key] = pcap
+    return out
+
+
+def count_running_review_origin_per_profile(
+    conn: sqlite3.Connection,
+) -> dict:
+    """Count in-flight REVIEW-origin runs per assignee (t_a0d28a97).
+
+    A review run is identified by its claim provenance — the
+    ``source_status=review`` marker :func:`claim_review_task` records on
+    the ``claimed`` event (the same marker ``_retry_status_for_run``
+    uses), joined through ``tasks.current_run_id`` so only the CURRENT
+    run of each ``running`` task counts. Implementation runs under the
+    same profile are invisible here by design: the review-lane cap must
+    not be consumed by non-review work (and vice versa — the TOTAL
+    per-profile cap still sees both).
+
+    Fails open to ``{}`` (no review lanes counted → lane can spawn): a
+    broken event payload or a legacy row without ``current_run_id`` is
+    never a reason to starve the review lane.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT t.assignee AS assignee, e.payload AS payload "
+            "FROM tasks t JOIN task_events e "
+            "  ON e.task_id = t.id AND e.run_id = t.current_run_id "
+            " AND e.kind = 'claimed' "
+            "WHERE t.status = 'running' AND t.current_run_id IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+    counts: dict = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("source_status") != "review":
+            continue
+        assignee = str(row["assignee"] or "").strip()
+        if not assignee:
+            continue
+        counts[assignee] = counts.get(assignee, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -10807,6 +11326,38 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Review-lane cap scaffolding (t_a0d28a97): resolve the scalar cap and
+    # per-profile overrides once per tick, and count in-flight
+    # REVIEW-origin runs per assignee. Counter keys are the RAW assignee
+    # strings (matching task rows), while cap lookups normalize — same
+    # convention as the total per-profile cap above.
+    _review_lane_scalar = review_lane_max_parallel()
+    _review_lane_caps: dict = {}
+    try:
+        _review_lane_caps = dict(review_lane_cap_map())
+    except Exception:
+        _review_lane_caps = {}
+    _any_review_lane_cap = (
+        _review_lane_scalar is not None or bool(_review_lane_caps)
+    )
+
+    def _review_lane_cap_for(assignee: Optional[str]) -> Optional[int]:
+        """Effective review-lane cap for one assignee (map > scalar > None)."""
+        if not assignee:
+            return None
+        mapped = _review_lane_caps.get(str(assignee).strip().lower())
+        if isinstance(mapped, int) and mapped > 0:
+            return mapped
+        return _review_lane_scalar
+
+    _review_lane_running: dict[str, int] = {}
+    if _any_review_lane_cap:
+        try:
+            _review_lane_running = count_running_review_origin_per_profile(
+                conn
+            )
+        except Exception:
+            _review_lane_running = {}
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -11043,6 +11594,25 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Review-LANE concurrency cap (t_a0d28a97, Captain ruling 12:25Z):
+        # bound how many REVIEW-origin workers one profile may have in
+        # flight, independently of the total per-profile cap. The Sep-9
+        # incident: 4 simultaneous review lanes under sportacus-reviewer
+        # (total cap 4) burned the shared zai pool and caused the
+        # 14:2xZ burst rate-limit wall. A profile at its review-lane cap
+        # simply doesn't claim more review cards — clean skip, no events,
+        # no failure ticks, no guard (identical semantics to a capped
+        # ready card; the review-spawn-starvation detector stays the net
+        # for a lane that never drains). Only the review loop consults
+        # this cap: ready-lane work under the same profile is untouched.
+        _review_lane_cap = _review_lane_cap_for(row["assignee"])
+        if _review_lane_cap is not None:
+            _rl_current = _review_lane_running.get(row["assignee"], 0)
+            if _rl_current >= _review_lane_cap:
+                result.skipped_review_lane_capped.append(
+                    (row["id"], row["assignee"], _rl_current)
+                )
+                continue
         _review_cap = _cap_for(row["assignee"])
         if _review_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
@@ -11067,6 +11637,12 @@ def _dispatch_once_locked(
             if _any_profile_cap:
                 _per_profile_running[row["assignee"]] = (
                     _per_profile_running.get(row["assignee"], 0) + 1
+                )
+            # t_a0d28a97: the dry-run path must respect the review-lane
+            # cap too, or dry runs over-report spawnable reviews.
+            if _any_review_lane_cap:
+                _review_lane_running[row["assignee"]] = (
+                    _review_lane_running.get(row["assignee"], 0) + 1
                 )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -11119,6 +11695,13 @@ def _dispatch_once_locked(
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            # t_a0d28a97: track the new review lane for this profile so
+            # later iterations in this same tick respect the review-lane
+            # cap (same tick-local accounting as the total cap).
+            if _any_review_lane_cap and claimed.assignee:
+                _review_lane_running[claimed.assignee] = (
+                    _review_lane_running.get(claimed.assignee, 0) + 1
+                )
             if _any_profile_cap and claimed.assignee:
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
@@ -11473,6 +12056,28 @@ def _default_spawn(
         # _apply_profile_override() via HERMES_PROFILE (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
+        pass
+    # t_d3f69e96: pin HERMES_REAL_HOME into the worker env. The kernel's
+    # root-kanban-config contract (see _root_kanban_cfg_candidates) expects
+    # dispatcher-spawned workers to carry it, but this spawn path never set
+    # it — workers resolved the PROFILE config as "root" and the root
+    # ``kanban:`` block (default_reviewer, per-profile cap map) was silently
+    # invisible to every worker-originated kanban_request_review (live
+    # Sep 9: review auto-route dead, starved reviews on t_f0e998f6 /
+    # t_456600d2). ``get_real_home`` is the same resolver the terminal
+    # subprocess sanitizer uses (hermes_constants.apply_subprocess_home_env
+    # sets exactly this var); it prefers an explicit HERMES_REAL_HOME, then
+    # HOME, then the passwd entry — on the dispatcher it yields the OS user
+    # home, the directory that CONTAINS .hermes/config.yaml with the knobs.
+    # Belt: never overwrite an inherited HERMES_REAL_HOME (operator/test
+    # override) and never touch HOME itself — this pin is additive.
+    try:
+        from hermes_constants import get_real_home as _get_real_home
+
+        _real_home = str(_get_real_home(env)).strip()
+        if _real_home and "HERMES_REAL_HOME" not in env:
+            env["HERMES_REAL_HOME"] = _real_home
+    except Exception:
         pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
@@ -12183,6 +12788,11 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _is_managed_scratch_path,
     _managed_scratch_path_info,
     _scratch_workspace,
+    resolve_workspace,
+    set_branch_name,
+    set_workspace_path,
+    _maybe_emit_scratch_tip,
+    _resolve_worktree_workspace,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_FAILURE_LIMIT,

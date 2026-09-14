@@ -33,6 +33,15 @@ upstream).
 | `cli.py` | `_kanban_exit_code_for_result` EX_TEMPFAIL(75) mapping + rate-limit sentinel sidecar writer, wired on both the quiet (-Q) and non-quiet (-q) single-query paths |
 | `hermes_cli/cli_chat_turn_mixin.py` | `_last_turn_failure_reason`/`_last_turn_failed` stash in `_chat_settle_turn` |
 | `locales/en.yaml` / `locales/zh.yaml` | kanban wake keys for the five hardening kinds |
+| `cron/scheduler_delivery.py` | webui cron delivery lane (t_993b18df): `webui` pseudo-platform in `_KNOWN_DELIVERY_PLATFORMS`, explicit `webui:<sid>` target resolution, `_deliver_to_webui` (HTTP POST into the WebUI's own `/api/chat/start` → server-side `[CRON DELIVERY]` turn), `_deliver_result` webui branch; persistent busy-redelivery spool (t_ee4b2f97): `_WebuiBusyError` sentinel, spool dir + backoff/horizon, `_deliver_pending_webui_reports`; t_70dd9cc7 honest busy-exhaust logging (recurring jobs self-heal, no scheduling claim) |
+| `cron/scheduler_preflight.py` | bot-chat-style preflight carve-out for `webui:` targets (t_993b18df) |
+| `cron/scheduler.py` | tick-time webui redelivery pass (every tick incl. idle; t_ee4b2f97) + webui-lane name re-export surface for the `cron.scheduler` monkeypatch contract |
+| `tools/cronjob_job_args.py` | webui-lane mode guidance notes (t_993b18df) |
+| `tests/cron/test_cron_webui_delivery.py` | t_993b18df/t_ee4b2f97/t_70dd9cc7: 24-check webui delivery suite (target resolution, preflight carve-out, HTTP lane, spool, redelivery, tick hook) |
+| `tests/hermes_cli/test_kanban_respawn_guard_staleness_t_3371481a.py` | t_3371481a: respawn-guard staleness + live-credential gates + rate-limit backoff suite |
+| `tests/hermes_cli/test_kanban_review_lane_cap_t_a0d28a97.py` | t_a0d28a97: serial review-lane per-profile cap suite |
+| `tests/hermes_cli/test_kanban_worker_real_home_t_d3f69e96.py` | t_d3f69e96: kanban worker real-home resolution suite |
+| `tests/plugins/test_coolify_deploy_watch.py` | t_9b07e08e: 35-check deploy-wake contract suite (payload shapes, session resolution, dedup, adopt-recent, scanner) |
 | `tests/hermes_cli/test_kanban_*.py` | the suites listed in the runbook below |
 
 Note: upstream's own `kanban_db_connect.py` executes `_kb.SCHEMA_SQL`
@@ -63,7 +72,12 @@ When a new upstream tag lands:
    `test_kanban_assignee_validation.py`,
    `test_kanban_dependency_block_t_17cda1e8.py`,
    `test_kanban_stuck_escalation_t_67d80b05.py`,
-   `test_kanban_default_reviewer_and_cap_map.py`).
+   `test_kanban_default_reviewer_and_cap_map.py`,
+   `test_kanban_respawn_guard_staleness_t_3371481a.py`,
+   `test_kanban_review_lane_cap_t_a0d28a97.py`,
+   `test_kanban_worker_real_home_t_d3f69e96.py`,
+   `test_cron_webui_delivery.py` (tests/cron),
+   `test_coolify_deploy_watch.py` (tests/plugins)).
 5. Push: `git push origin kernel-hardening`.
 6. Deploy the Coolify stack (one stack deploy). Post a heads-up comment on
    the sportacus board first if workers are running (restart-window

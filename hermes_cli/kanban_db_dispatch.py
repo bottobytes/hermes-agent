@@ -110,6 +110,16 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_review_lane_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Review cards deferred this tick because their assignee is already
+    at the review-LANE cap (t_a0d28a97: ``kanban.review_lane_max_parallel``
+    or ``kanban.review_lane_max_parallel_map``). Each entry is
+    ``(task_id, assignee, current_review_lane_count)``. Same clean-skip
+    semantics as ``skipped_per_profile_capped`` — no events, no failure
+    ticks, no guard: the card stays review-queued with clean fields until
+    the assignee's surviving review lane finishes, exactly the visual of
+    a full lane (the review-spawn-starvation detector remains the
+    observability net for a lane that NEVER drains)."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)

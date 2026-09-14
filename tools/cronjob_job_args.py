@@ -98,6 +98,18 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
                 "automatically.")
         if _deliver.startswith("bot-chat:"):
             notes.append("Targeting another profile's Bot Chat costs that bot an agent turn per run.")
+        # t_993b18df: webui delivery lane documentation.
+        _has_webui_token = any(
+            p.strip().lower().split(":", 1)[0] == "webui"
+            for p in _deliver.split(",")
+            if p.strip()
+        )
+        if _has_webui_token:
+            notes.append(
+                "webui delivery POSTs the report into the target WebUI "
+                "browser session as an automatic [CRON DELIVERY] agent turn "
+                "(that session's agent processes the report in-session)."
+            )
         # platform:chat_id with no thread segment loses topic targeting.
         for target in _deliver.split(","):
             parts = target.strip().split(":")
@@ -111,6 +123,17 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
                     "segment — on thread/topic platforms the delivery lands in "
                     "the main chat, not a topic.")
                 break
+    _origin_raw = job.get("origin")
+    _origin = _origin_raw if isinstance(_origin_raw, dict) else {}
+    if (
+        str(_origin.get("platform", "")).lower() == "webui"
+        and (not _deliver or "origin" in _deliver.split(","))
+    ):
+        notes.append(
+            "deliver=origin from this WebUI session: when the job fires, its "
+            "report is delivered back into THIS browser session as an "
+            "automatic [CRON DELIVERY] turn (webui delivery lane, t_993b18df)."
+        )
     return notes
 
 

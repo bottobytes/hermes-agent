@@ -229,6 +229,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
+            # WebUI delivery is local HTTP to the WebUI's own server (no
+            # gateway credentials) -- same carve-out class as bot-chat
+            # (t_993b18df).
+            if part.split(":", 1)[0].strip().lower() == _delivery.WEBUI_DELIVERY_PLATFORM:
+                continue
             platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
         return None
