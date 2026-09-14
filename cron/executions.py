@@ -26,7 +26,10 @@ from hermes_time import now as _hermes_now
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+# t_fc76cfa8: 'relinquished' is a terminal, NON-failure outcome — a fire
+# attempt that lost the at-most-once race and never ran. It is pruned by
+# the same terminal cap and excluded from failure classification.
+_TERMINAL_STATES = ("completed", "failed", "unknown", "relinquished")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -48,7 +51,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
+               ('claimed','running','completed','failed','unknown','relinquished')),
              handoff_pending INTEGER NOT NULL DEFAULT 0,
              handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
@@ -57,6 +60,66 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    # t_fc76cfa8: the CHECK constraint above only applies to NEW tables on
+    # fresh installs. Existing deployments initialized the executions table
+    # with the 5-state constraint before 'relinquished' existed; CREATE TABLE
+    # IF NOT EXISTS is a no-op on an existing table, so SQLite keeps enforcing
+    # the OLD constraint. Migrate in place: rebuild the table with the widened
+    # constraint, copying rows verbatim. SQLite DDL is transactional and these
+    # are plain execute() calls (executescript would COMMIT the ambient
+    # transaction), so the swap is atomic with the marker-table write that
+    # makes it run exactly once per database file. Fail-safe: any error is
+    # swallowed — an unmigrated DB simply rejects 'relinquished' writes and
+    # callers fall back to their pre-t_fc76cfa8 behavior.
+    try:
+        migrated = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ("executions_status_migration_t_fc76cfa8",),
+        ).fetchone()
+        if migrated is None:
+            sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'"
+            ).fetchone()
+            create_sql = str(sql_row[0]) if sql_row else ""
+            if create_sql and "relinquished" not in create_sql:
+                conn.execute(
+                    """CREATE TABLE executions_migrate_t_fc76cfa8 (
+                         id TEXT PRIMARY KEY,
+                         job_id TEXT NOT NULL,
+                         source TEXT NOT NULL,
+                         process_id TEXT NOT NULL,
+                         pid INTEGER NOT NULL,
+                         process_started_at INTEGER,
+                         status TEXT NOT NULL CHECK(status IN
+                           ('claimed','running','completed','failed','unknown','relinquished')),
+                         handoff_pending INTEGER NOT NULL DEFAULT 0,
+                         handoff_started_at REAL,
+                         claimed_at TEXT NOT NULL,
+                         started_at TEXT,
+                         finished_at TEXT,
+                         error TEXT
+                       )"""
+                )
+                conn.execute(
+                    """INSERT INTO executions_migrate_t_fc76cfa8
+                         (id, job_id, source, process_id, pid, process_started_at,
+                          status, handoff_pending, handoff_started_at,
+                          claimed_at, started_at, finished_at, error)
+                       SELECT id, job_id, source, process_id, pid, process_started_at,
+                              status, 0, NULL,
+                              claimed_at, started_at, finished_at, error
+                       FROM executions"""
+                )
+                conn.execute("DROP TABLE executions")
+                conn.execute(
+                    "ALTER TABLE executions_migrate_t_fc76cfa8 RENAME TO executions"
+                )
+            conn.execute(
+                "CREATE TABLE executions_status_migration_t_fc76cfa8 ("
+                " done INTEGER NOT NULL DEFAULT 1)"
+            )
+    except Exception:
+        pass
     from hermes_cli.sqlite_util import add_column_if_missing
 
     add_column_if_missing(
@@ -130,7 +193,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','unknown','relinquished')
              ORDER BY finished_at DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
@@ -258,6 +321,44 @@ def finish_execution(
         _prune_unlocked(conn)
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
+    return record
+
+
+def relinquish_execution(execution_id: str, *, reason: str = "") -> Optional[Dict[str, Any]]:
+    """Retire a losing claim attempt WITHOUT recording a failure (t_fc76cfa8).
+
+    A race between two legitimate firers of the same cron job (daemon fire vs
+    gateway ticker, external provider vs ticker, multi-replica at-most-once)
+    leaves the loser holding an execution row that never started running.
+    Writing ``failed`` there corrupts the ledger: the fire itself succeeded
+    under the winner, so the loser's row is bookkeeping noise, not an
+    execution failure — yet health-gate tooling and failure-streak counters
+    read it as one, and `cronjob list` shows a healthy job as failing.
+
+    This transitions the row to a NEW terminal state ``relinquished``: the
+    attempt provably never ran (no agent, no side effect, no output) because
+    the durable fire claim went to another firer. Unlike ``unknown`` it is not
+    ambiguous; unlike ``failed`` it is not a failure. Rows in this state are
+    pruned by the same terminal cap as other terminal rows.
+
+    Idempotent: a row already in ANY terminal state is returned unchanged
+    (never rewritten — terminal states stay immutable), so a losing side that
+    re-checks after the winner already finished cannot flip the outcome.
+    """
+    now = _hermes_now().isoformat()
+    detail = (str(reason).strip() or
+              "Fire claim lost to a concurrent firer; this attempt never ran.")
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET status='relinquished', finished_at=?, error=?
+               WHERE id=? AND status IN ('claimed','running')""",
+            (now, detail, execution_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        _prune_unlocked(conn)
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
     return record
 
 

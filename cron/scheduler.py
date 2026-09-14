@@ -461,12 +461,13 @@ def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | No
 
 
 from cron.jobs import (
-    _ensure_cron_dir, advance_next_runs, claim_dispatch, claim_job_for_fire, fire_claim_fence,
-    clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
-    save_job_output, use_cron_store)
+    _ensure_cron_dir, _current_cron_store, advance_next_runs, claim_dispatch, claim_job_for_fire,
+    fire_claim_fence, clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim,
+    mark_job_run, save_job_output, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, create_execution, finish_execution, get_execution,
-    mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
+    mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions,
+    relinquish_execution)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -1106,6 +1107,51 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS = _RUN_CLAIM_HEARTBEAT_SECONDS * 3
+# t_e7356d78 (round 3): re-probe backoff ladder for fire-claim ownership
+# checks. Round 2's single 0.25s re-probe was beaten by dual-scheduler boot
+# catch-up contention (12:43:18 boot burst, row 2bd51483; drill burst
+# 13:22:18, row 07e495b4): both probe+re-probe landed inside the same
+# contention window and returned False twice on an owned claim. The ladder
+# spreads the confirmation window to ~0.75s so a transient burst must
+# persist across three probes to register as confirmed loss.
+_FIRE_CLAIM_REPROBE_LADDER_SECONDS = (0.25, 0.5)
+
+
+def _confirm_fire_claim_loss(job_id: str, *, expected_owner: str) -> bool:
+    """Probe fire-claim ownership; on a False, re-probe down the backoff
+    ladder before believing it. Returns True only when every probe says
+    the claim is lost (a durable takeover persists; a contention transient
+    recovers). UNKNOWN (``None``) and probe exceptions are treated as
+    "cannot prove loss" — optimistic, bounded by the heartbeat grace and
+    the durable ``expected_fire_owner`` CAS on every terminal write.
+    """
+    probes = 0
+    for delay in (0.0,) + _FIRE_CLAIM_REPROBE_LADDER_SECONDS:
+        if delay:
+            time.sleep(delay)
+        probes += 1
+        try:
+            result = heartbeat_fire_claim(job_id, expected_owner=expected_owner)
+        except Exception:
+            logger.debug(
+                "Job '%s': fire_claim ownership probe %d failed",
+                job_id,
+                probes,
+                exc_info=True,
+            )
+            return False  # cannot prove loss
+        if result is None:
+            logger.warning(
+                "Job '%s': fire fence unavailable at ownership probe %d; "
+                "treating ownership as unproven (continuing run)",
+                job_id,
+                probes,
+            )
+            return False  # UNKNOWN — cannot prove loss
+        if result:
+            return False  # confirmed owned
+    # Every probe in the ladder returned False: durable takeover.
+    return True
 
 
 def _cron_cleanup_timeout_seconds() -> float:
@@ -2377,14 +2423,53 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
+        pending_loss_since: Optional[float] = None
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
             try:
                 if not heartbeat_fire_claim(job_id, expected_owner=owner):
-                    lost_ownership.set()
-                    logger.warning(
-                        "Job '%s': fire claim ownership lost; interrupting stale run",
-                        job_id)
-                    return
+                    # t_e7356d78 (round 3): one beat's False — or even a
+                    # False confirmed across the re-probe ladder — no
+                    # longer fences the run immediately. Boot-contention
+                    # transients (12:43:18 boot burst row 2bd51483;
+                    # 13:22:18 drill burst row 07e495b4) outlasted round
+                    # 2's 0.25s re-probe while ownership provably never
+                    # changed. A REAL takeover is durable: it survives to
+                    # the next beat ~60s later. So: confirm through the
+                    # ladder, remember the loss is pending, and only fence
+                    # if the NEXT beat also confirms loss. A 60s delay in
+                    # fencing a genuinely stale run costs nothing against
+                    # the 300s claim TTL; a transient is survived. An
+                    # UNKNOWN (None) beat resets the ladder — it proves
+                    # nothing either way — and is bounded by the
+                    # last_confirmed grace below.
+                    time.sleep(_FIRE_CLAIM_REPROBE_LADDER_SECONDS[0])
+                    if _confirm_fire_claim_loss(job_id, expected_owner=owner):
+                        if pending_loss_since is None:
+                            pending_loss_since = time.monotonic()
+                            logger.warning(
+                                "Job '%s': fire claim loss signal at beat; "
+                                "deferring fence to next beat (round-3 "
+                                "age gate)",
+                                job_id,
+                            )
+                        else:
+                            lost_ownership.set()
+                            logger.warning(
+                                "Job '%s': fire claim ownership lost across "
+                                "consecutive beats; interrupting stale run",
+                                job_id,
+                            )
+                            return
+                    else:
+                        if pending_loss_since is not None:
+                            logger.warning(
+                                "Job '%s': pending fire-claim loss recovered; "
+                                "run continues",
+                                job_id,
+                            )
+                        pending_loss_since = None
+                else:
+                    pending_loss_since = None
                 last_confirmed = time.monotonic()
             except Exception:
                 logger.debug("Job '%s': fire_claim heartbeat failed", job_id, exc_info=True)
@@ -2463,24 +2548,62 @@ def run_one_job(
     fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     execution_token = object()
     profile_home = _get_hermes_home().resolve()
+    # t_c3f925f6: pin the cron store for the whole run (execute → fence →
+    # mark). This scheduler can be hosted inside the WebUI server process
+    # (single-box fleet), where profile-scoped HTTP requests transiently
+    # flip process-global HERMES_HOME and cron.jobs' CRON_DIR/JOBS_FILE/
+    # OUTPUT_DIR constants (api/profiles.py legacy context managers).
+    # Without the pin, a fire-claim heartbeat beat, side-effect fence, or
+    # terminal mark_job_run resolving the store inside such a window reads
+    # the PROFILE's jobs.json, finds this job absent, and reports phantom
+    # "ownership lost" that killed healthy runs (2026-09-10 rows
+    # 2bd51483/07e495b4/2855/d90d235c/2890). use_cron_store() is
+    # precedence #1 in _current_cron_store() — immune to both the env
+    # flip and the module re-patch — and contextvars.copy_context()
+    # propagates it into the heartbeat thread the run wrapper spawns.
+    #
+    # The pin freezes the CURRENTLY RESOLVED store — _current_cron_store()
+    # at dispatch origin — so it composes with an outer use_cron_store()
+    # the CALLER may already hold and never overrides a deliberate caller
+    # pin with the env-resolved home. Capture happens here, before any
+    # concurrent flip can poison it.
+    _pin_home = _current_cron_store().cron_dir.parent
+    _home_pin_reset = None
+    _home_pin_token = None
+    if str(_pin_home) != str(profile_home):
+        # The resolved store's home differs from the env home (an outer
+        # use_cron_store pin is active): keep the store pin, and pin the
+        # home override to the STORE's home so executions-ledger paths
+        # (get_hermes_home-based) follow the same store.
+        try:
+            from hermes_constants import (
+                reset_hermes_home_override as _reset_home_override,
+                set_hermes_home_override as _set_home_override,
+            )
+            _home_pin_reset = _reset_home_override
+            _home_pin_token = _set_home_override(str(_pin_home))
+        except Exception:
+            _home_pin_reset = None
+            _home_pin_token = None
     with _running_lock:
         _running_fire_owners.setdefault(job["id"], {})[execution_token] = (
             fire_owner or None, profile_home)
     try:
-        return _run_with_fire_claim_heartbeat(
-            job,
-            lambda lost_ownership: _run_one_job_body(
+        with use_cron_store(_pin_home):
+            return _run_with_fire_claim_heartbeat(
                 job,
-                adapters=adapters,
-                loop=loop,
-                verbose=verbose,
-                extra_prompt=extra_prompt,
-                fire_claim_lost=(
-                    _CombinedCancelEvent(lost_ownership, cancel_event)
-                    if cancel_event is not None
-                    else lost_ownership
-                ),
-                execution_token=execution_token))
+                lambda lost_ownership: _run_one_job_body(
+                    job,
+                    adapters=adapters,
+                    loop=loop,
+                    verbose=verbose,
+                    extra_prompt=extra_prompt,
+                    fire_claim_lost=(
+                        _CombinedCancelEvent(lost_ownership, cancel_event)
+                        if cancel_event is not None
+                        else lost_ownership
+                    ),
+                    execution_token=execution_token))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
@@ -2488,22 +2611,59 @@ def run_one_job(
                 executions.pop(execution_token, None)
                 if not executions:
                     _running_fire_owners.pop(job["id"], None)
+        if _home_pin_reset is not None and _home_pin_token is not None:
+            try:
+                _home_pin_reset(_home_pin_token)
+            except Exception:
+                pass
 
 
 _OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
 
 
-def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
+def _record_fire_ownership_lost(
+    job_id: str, fire_owner: Optional[str], execution_id: str, *, success: Optional[bool] = None,
+) -> bool:
     """Bookkeeping after fire-claim ownership loss. A transport-level cancel (dashboard drain) is
     not a real loss — we still own the claim, so record the interruption via the owner-fenced
-    terminal write instead of leaving fire_claim/last_status stale; otherwise discard."""
-    if fire_owner is not None and heartbeat_fire_claim(job_id, expected_owner=fire_owner):
+    terminal write instead of leaving fire_claim/last_status stale; otherwise discard.
+
+    Returns True when the run was retired/discarded (the caller returns too);
+    False when the loss signal was transient or unprovable on a COMPLETED run
+    and normal bookkeeping must proceed.
+
+    t_fc76cfa8 (round 2, 2026-09-10 03:04:58 incident): an owned claim must
+    ALSO imply the run's bookkeeping proceeds normally — the card's "claim
+    token checked before final status write". A COMPLETED run (success=True)
+    whose loss signal was disconfirmed by the owner probe must never be
+    failed: that exact shape flipped a finished wake run to failed 144ms
+    after "completed successfully" with the reply already delivered on Buzz.
+    Only an actually-interrupted (agent-aborted / transport-cancelled) run
+    records the interruption; a finished one falls through to normal
+    mark_job_run + delivery bookkeeping, with the durable
+    expected_fire_owner CAS inside mark_job_run as the final arbiter of
+    whether this owner may write the job record. t_e7356d78 (round 3): a
+    None probe (ownership unprovable under contention) can no longer
+    discard a completed run either.
+    """
+    _still_owner = fire_owner is not None and (
+        heartbeat_fire_claim(job_id, expected_owner=fire_owner) is not False
+    )
+    if _still_owner and success:
+        logger.info(
+            "Job '%s': post-run ownership signal was transient or unprovable; "
+            "run bookkeeping proceeds normally",
+            job_id,
+        )
+        return False
+    if _still_owner:
         mark_job_run(job_id, False, _OWNERSHIP_LOST_INTERRUPTED, expected_fire_owner=fire_owner)
         finish_execution(execution_id, success=False, error=_OWNERSHIP_LOST_INTERRUPTED)
-    else:
-        finish_execution(
-            execution_id, success=False,
-            error="Fire claim ownership lost; stale result was discarded.")
+        return True
+    finish_execution(
+        execution_id, success=False,
+        error="Fire claim ownership lost; stale result was discarded.")
+    return True
 
 
 def _classify_delivery_outcome(
@@ -2586,16 +2746,17 @@ class _FireOwnership:
             return True
         if self.owner is None:
             return False
-        try:
-            if heartbeat_fire_claim(self.job["id"], expected_owner=self.owner):
-                return False
-        except Exception:
-            logger.debug(
-                "Job '%s': fire_claim ownership validation failed", self.job["id"], exc_info=True)
-            return False
-        if self.fire_claim_lost is not None:
-            self.fire_claim_lost.set()
-        return True
+        # t_e7356d78 (round 3): route through the shared ladder helper —
+        # probe with backoff (0.25s, 0.5s), treat UNKNOWN (fence
+        # unavailable) and exceptions as "cannot prove loss", and only
+        # declare loss when every ladder probe reports the claim held by
+        # another owner (a durable takeover persists across the window;
+        # a boot-contention transient does not).
+        if _confirm_fire_claim_loss(self.job["id"], expected_owner=self.owner):
+            if self.fire_claim_lost is not None:
+                self.fire_claim_lost.set()
+            return True
+        return False
 
 
 @dataclass
@@ -2880,9 +3041,16 @@ def _run_one_job_body(
             raise
 
         if _fire_claim_ownership_lost():
-            _teardown_deferred()
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
-            return True
+            # t_fc76cfa8 (round 2): a completed run whose loss signal was
+            # transient/unprovable must fall through to normal bookkeeping,
+            # never be rewritten to failed. Teardown happens only when the
+            # run is actually retired — the fall-through keeps the deferred
+            # agent alive through delivery (upstream contract).
+            if _record_fire_ownership_lost(
+                job["id"], fire_owner, execution_id, success=success
+            ):
+                _teardown_deferred()
+                return True
 
         # Agent is still live through delivery; wrap ALL of save/compose/deliver in try/finally so a
         # raise anywhere still tears the deferred agent down.
@@ -2899,8 +3067,15 @@ def _run_one_job_body(
             _teardown_deferred()
 
         if d.side_effect_ownership_lost or _fire_claim_ownership_lost():
-            _record_fire_ownership_lost(job["id"], fire_owner, execution_id)
-            return True
+            # t_fc76cfa8 (round 2): same completed-run guard as the
+            # pre-side-effect gate — an owned claim plus a COMPLETED run
+            # falls through to normal bookkeeping; only a genuinely
+            # interrupted run records the interruption, and only a real
+            # ownership loss discards.
+            if _record_fire_ownership_lost(
+                job["id"], fire_owner, execution_id, success=d.success
+            ):
+                return True
 
         # Empty final_response is a soft failure so last_status is not "ok".
         if d.success and not final_response.strip():
@@ -3543,8 +3718,17 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     claimed = claim_job_for_fire(job["id"], return_job=True)
     if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        # t_fc76cfa8: this firer LOST the race — another firer (WS
+        # daemon fire, external provider, another tick) won the claim
+        # and is running the job. That is not a failure of THIS
+        # attempt: no agent ran, no side effect happened. Recording
+        # ``failed`` here corrupted the ledger (health gates and
+        # failure-streak counters read it as a real failure) —
+        # retire the row as relinquished instead.
+        relinquish_execution(
+            job["execution_id"],
+            reason="Fire claim lost to a concurrent firer; "
+                   "execution was not started.")
         return True
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)

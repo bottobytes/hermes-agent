@@ -2454,7 +2454,7 @@ def _refresh_claim(jobs: List[Dict[str, Any]], claim: Any, expected_owner: str) 
     return True
 
 
-def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
+def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> Optional[bool]:
     """Refresh a one-shot's ``run_claim`` timestamp while its run is alive, so an expired claim
     really means the claiming process died. Compare-and-refresh on ``expected_owner`` stops a stale
     runner from extending a claim another process has since taken over.
@@ -2463,13 +2463,20 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     fresh: an expired claim then really does mean "the claiming process died", and neither another process's
     tick nor this process's own next tick will re-dispatch or stale-remove the job while the run is in
     flight. mark_job_run() clears the claim on completion.
+
+    Returns True if this owner's one-shot claim was refreshed; False when the
+    job, claim, or ownership no longer matches.  t_c3f925f6: a job ABSENT
+    from the resolved store returns None (UNKNOWN) instead of False — the
+    heartbeat may have resolved the wrong store mid profile-scoped flip
+    (same phantom-loss class ``_heartbeat_fire_claim_locked`` now guards);
+    callers only log, they never fence on the return value.
     """
     def apply(jobs, _i, job):
         if job.get("schedule", {}).get("kind") != "once":
             return False
         return _refresh_claim(jobs, job.get("run_claim"), expected_owner)
 
-    return _with_job(job_id, apply, False)
+    return _with_job(job_id, apply, None)
 
 
 def clear_run_claim(job_id: str) -> bool:
@@ -2590,13 +2597,33 @@ def claim_job_for_fire(
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 
 
-def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
-    """Refresh an active ``fire_claim`` without extending another owner's lease: an execution may
-    outlive the TTL, and the owner check stops a stale runner from refreshing a recovered claim."""
+def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> Optional[bool]:
+    """Refresh an active ``fire_claim`` and report ownership.
+
+    t_e7356d78 (round 3): returns a tri-state — ``True`` (ownership
+    confirmed AND lease refreshed), ``False`` (ownership provably lost:
+    the claim is held by another owner, or the job no longer exists),
+    ``None`` (UNKNOWN: the cross-process fire fence could not be
+    acquired, so ownership could not be verified either way). The
+    2026-09-10 12:43:18 boot-contention incident (row 2bd51483) fenced
+    a healthy in-flight run because a flock timeout under dual-scheduler
+    catch-up was indistinguishable from a lost claim; callers must treat
+    ``None`` as "cannot prove loss", never as loss.
+
+    t_c3f925f6: the locked body returns None (UNKNOWN) when the job id is
+    ABSENT from the resolved store — only a PRESENT claim held by a
+    DIFFERENT owner is provable loss. The heartbeat may have resolved the
+    wrong store mid profile-scoped flip (WebUI host flipping process-global
+    HERMES_HOME + this module's CRON_DIR/JOBS_FILE/OUTPUT_DIR constants),
+    so absence is not loss. Callers treat None as "cannot prove loss".
+    """
     def apply(jobs, _i, job):
         return _refresh_claim(jobs, job.get("fire_claim"), expected_owner)
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    with _fire_job_lock(job_id) as acquired:
+        if not acquired:
+            return None
+        return _with_job(job_id, apply, None)
 
 
 # Completed one-shots are retained in jobs.json (final status stays inspectable) and pruned by

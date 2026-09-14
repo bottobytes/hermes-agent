@@ -21,10 +21,13 @@ from cron.scheduler import get_running_job_ids
 from hermes_time import now as _now
 
 logger = logging.getLogger(__name__)
-_KNOWN_STATUSES = {"claimed", "running", "completed", "failed", "unknown"}
+# t_fc76cfa8: 'relinquished' is a terminal, NON-failure outcome — a fire
+# attempt that lost the at-most-once race and never ran. It projects as
+# itself (below) and is excluded from failure/error classification.
+_KNOWN_STATUSES = {"claimed", "running", "completed", "failed", "unknown", "relinquished"}
 _KNOWN_SOURCES = {"builtin", "direct", "external"}
 _KNOWN_DELIVERY_OUTCOMES = {"queued", "delivered", "failed", "suppressed", "suppressed_acked", "not_configured"}
-_TERMINAL_STATUSES = {"completed", "failed", "unknown"}
+_TERMINAL_STATUSES = {"completed", "failed", "unknown", "relinquished"}
 
 
 @dataclass(frozen=True, slots=True)

@@ -307,6 +307,145 @@ class GatewayKanbanWatchersMixin:
         # tick-gated probe below only re-arms after the key changes).
         _stuck_escalated_key: Optional[str] = None
         _stuck_last_probe_at = 0.0
+        # t_48bc654b: alert + self-heal ladder for the update-recovery
+        # defect class. The 2026-09-09 incident: a wedged incarnation sat
+        # 96 ticks (~96 min) with spawnable ready work and 0 spawns while
+        # the only alert channel (a triage card nobody was awake to read)
+        # stayed silent — the Captain found out from a dead WebUI. The
+        # existing t_67d80b05 escalation files ONE card per episode; this
+        # ladder ADDS (a) a push alert over any connected messaging
+        # adapter the moment the card is filed, and (b) a bounded
+        # gateway-self-restart (subprocess restart via request_restart,
+        # NEVER a Docker Engine API container restart) when the streak
+        # blows past the restart threshold. Both are config-gated and
+        # fail open: unreadable config = defaults below, 0 disables.
+        _stuck_alert_last_sent_at = 0.0
+        _stuck_restart_done = False
+
+        def _stuck_alert_chat_targets() -> "list[tuple[Any, str]]":
+            """Best-effort (adapter, chat_id) targets for stuck alerts.
+
+            Prefers kanban.stuck_alert_chat_id from the operator config;
+            falls back to the FIRST dm entry per connected messaging
+            platform in the persisted channel directory (the Captain's
+            DM on this fleet). Never raises.
+            """
+            try:
+                cfg_now = _load_config() or {}
+                preferred = str(
+                    (cfg_now.get("kanban", {}) or {}).get(
+                        "stuck_alert_chat_id", ""
+                    ) or ""
+                ).strip()
+            except Exception:
+                preferred = ""
+            targets: "list[tuple[Any, str]]" = []
+            adapters = getattr(self, "adapters", None) or {}
+            for platform_key, adapter in adapters.items():
+                if not getattr(adapter, "is_connected", False):
+                    continue
+                if preferred:
+                    targets.append((adapter, preferred))
+                    continue
+                # Channel-directory fallback: first dm entry for this
+                # platform. Read fresh each call — the directory rotates.
+                try:
+                    from gateway.channel_directory import DIRECTORY_PATH
+
+                    def _first_dm() -> Optional[str]:
+                        import json as _json
+
+                        try:
+                            data = _json.loads(
+                                DIRECTORY_PATH.read_text(encoding="utf-8")
+                            )
+                        except Exception:
+                            return None
+                        pname = getattr(platform_key, "value", str(platform_key))
+                        for entry in (
+                            (data.get("platforms", {}) or {}).get(pname) or []
+                        ):
+                            cid = str(
+                                entry.get("id") or entry.get("chat_id") or ""
+                            ).strip()
+                            if cid:
+                                return cid
+                        return None
+
+                    cid = _first_dm()
+                    if cid:
+                        targets.append((adapter, cid))
+                except Exception:
+                    continue
+            return targets
+
+        async def _send_stuck_alert(bad_ticks_now: int, extra: str = "") -> None:
+            """Push a stuck-dispatcher alert to every connected adapter.
+
+            Non-fatal by construction: any failure is logged at debug and
+            the ladder continues (the triage card is the durable record;
+            this is the wake-the-human channel). Rate-limited to one
+            alert per 15 minutes per episode so a long wedge pages once,
+            not per tick.
+            """
+            nonlocal _stuck_alert_last_sent_at
+            now = time.time()
+            if now - _stuck_alert_last_sent_at < 900.0:
+                return
+            _stuck_alert_last_sent_at = now
+            text = (
+                f"⚠️ Kanban dispatcher stuck: {bad_ticks_now} consecutive "
+                f"ticks with spawnable ready work and 0 workers spawned. "
+                f"A triage card has been filed{extra}. "
+                f"Check `hermes kanban list --status ready` and profile "
+                f"health (venv/PATH/credentials) — t_48bc654b."
+            )
+            for adapter, chat_id in _stuck_alert_chat_targets():
+                try:
+                    await adapter.send(chat_id, text)
+                    logger.info(
+                        "kanban dispatcher: stuck alert delivered to %s/%s",
+                        getattr(adapter, "name", "?"), chat_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "kanban dispatcher: stuck alert send failed",
+                        exc_info=True,
+                    )
+
+        def _resolve_stuck_restart_ticks() -> int:
+            """t_48bc654b — gateway self-restart threshold in ticks.
+
+            HERMES_KANBAN_STUCK_RESTART_TICKS env wins, then
+            kanban.stuck_restart_ticks in config.yaml, then the default
+            (45 ticks ≈ 45 min at the 60s interval). 0 DISABLES the
+            self-restart (alerts + card remain). The threshold is
+            deliberately above the t_67d80b05 escalation threshold (30)
+            so the card + alert fire first and the restart is the
+            last-resort rung of the ladder.
+            """
+            raw = os.environ.get(
+                "HERMES_KANBAN_STUCK_RESTART_TICKS", ""
+            ).strip()
+            if raw:
+                try:
+                    parsed = int(raw)
+                except ValueError:
+                    parsed = -1
+                if parsed >= 0:
+                    return parsed
+            try:
+                cfg_val = (
+                    (_load_config() or {}).get("kanban", {}) or {}
+                ).get("stuck_restart_ticks")
+                if cfg_val is not None:
+                    parsed = int(cfg_val)
+                    if parsed >= 0:
+                        return parsed
+            except Exception:
+                pass
+            return 45
+
         dispatcher = _KanbanDispatcher(_kb, settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
@@ -484,11 +623,58 @@ class GatewayKanbanWatchersMixin:
                             "t_67d80b05)",
                             bad_ticks, _esc[0],
                         )
+                        # t_48bc654b rung 2: wake the human, not just the
+                        # board. The card is durable but passive; this push
+                        # is what turns a silent 96-min wedge into a page.
+                        try:
+                            await _send_stuck_alert(
+                                bad_ticks, extra=f" ({_esc[0]})"
+                            )
+                        except Exception:
+                            logger.debug(
+                                "kanban dispatcher: stuck alert ladder "
+                                "raised; delivery failed",
+                                exc_info=True,
+                            )
                 elif bad_ticks == 0:
                     # Healthy tick — re-arm the escalation episode so the
                     # NEXT wedge files a fresh card even if its signature
                     # happens to collide with the previous incident's.
                     _stuck_escalated_key = None
+                # t_48bc654b rung 3: bounded gateway self-restart. When
+                # the streak has blown PAST the restart threshold the
+                # wedge is by definition not self-healing (spawns stay 0
+                # while spawnable work waits) — the sanctioned remedy is
+                # the gateway's own restart path (request_restart via the
+                # service supervisor: same path /restart uses), NEVER a
+                # Docker Engine API container restart (the 2026-09-09
+                # 18:41 lesson: self-restarting our own container from
+                # inside wedged its networking for 2h). Fires at most
+                # ONCE per episode (the _stuck_restart_done latch) and is
+                # disabled by kanban.stuck_restart_ticks=0.
+                _stuck_restart_threshold = _resolve_stuck_restart_ticks()
+                if (
+                    _stuck_restart_threshold > 0
+                    and bad_ticks >= _stuck_restart_threshold
+                    and not _stuck_restart_done
+                ):
+                    _stuck_restart_done = True
+                    logger.error(
+                        "kanban dispatcher: STUCK-RESTART — %d ticks with "
+                        "0 spawns (threshold %d); requesting a gateway "
+                        "service restart via the supported subprocess path "
+                        "(t_48bc654b). In-flight turns are drained first.",
+                        bad_ticks, _stuck_restart_threshold,
+                    )
+                    try:
+                        self.request_restart(detached=True, via_service=True)
+                    except Exception:
+                        logger.error(
+                            "kanban dispatcher: STUCK-RESTART request "
+                            "failed; leaving recovery to the operator "
+                            "(triage card already filed)",
+                            exc_info=True,
+                        )
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()

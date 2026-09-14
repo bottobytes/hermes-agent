@@ -152,7 +152,12 @@ class CronScheduler(ABC):
     def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
-        from cron.executions import create_execution, finish_execution, set_execution_occurrence
+        from cron.executions import (
+            create_execution,
+            finish_execution,
+            relinquish_execution,
+            set_execution_occurrence,
+        )
         from cron.jobs import claim_job_for_fire
 
         execution = create_execution(job_id, source=self.name)
@@ -172,7 +177,32 @@ class CronScheduler(ABC):
             )
             raise
         if not isinstance(claimed_job, dict):
-            finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
+            # t_fc76cfa8: the claim went to a concurrent firer (or the job is
+            # not runnable). Distinguish the two: a lost race is normal
+            # at-most-once bookkeeping (relinquish), not a failure; an absent
+            # job / paused state is a genuine claim rejection.
+            from cron.jobs import get_job, is_job_runnable
+            rejected_reason = None
+            try:
+                refreshed = get_job(job_id)
+                if refreshed is None:
+                    rejected_reason = "job no longer exists"
+                elif not is_job_runnable(refreshed):
+                    rejected_reason = "job is paused or disabled"
+            except Exception:
+                rejected_reason = None  # unresolvable — treat as lost race
+            if rejected_reason is not None:
+                finish_execution(
+                    execution["id"],
+                    success=False,
+                    error=f"Fire claim rejected: {rejected_reason}.",
+                )
+            else:
+                relinquish_execution(
+                    execution["id"],
+                    reason="Fire claim lost to a concurrent firer; "
+                           "execution was not started.",
+                )
             return None
         claimed_job["execution_id"] = execution["id"]
         return claimed_job

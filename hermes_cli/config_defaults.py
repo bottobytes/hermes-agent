@@ -1799,6 +1799,24 @@ DEFAULT_CONFIG = {
         # configured name that does not resolve falls back to a blocked
         # card carrying the misconfiguration in its title.
         "stuck_escalation_assignee": "hermes-sysop",
+        # t_48bc654b: gateway SELF-RESTART threshold for a dispatcher
+        # wedge. When the ready queue is non-empty with 0 workers
+        # spawned for this many consecutive ticks (≈ minutes at the 60s
+        # interval) — past the stuck_escalation_ticks card AND the push
+        # alert — the gateway requests its own restart via the supported
+        # service path (request_restart; the same path the /restart
+        # slash command uses; in-flight turns drain first). NEVER a
+        # Docker Engine API container restart. 0 disables the
+        # self-restart rung (card + alert remain). Default 45 keeps a
+        # 15-minute gap after the escalation card for an operator to
+        # intervene first.
+        "stuck_restart_ticks": 45,
+        # t_48bc654b: chat_id for the dispatcher-stuck push alert. The
+        # alert rides any connected messaging adapter (Telegram first on
+        # this fleet). When empty, the alert falls back to the FIRST dm
+        # entry per connected platform in channel_directory.json (the
+        # Captain's DM). Set an explicit chat id to pin the target.
+        "stuck_alert_chat_id": "",
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
